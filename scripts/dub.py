@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 import time
 import wave
 from pathlib import Path
@@ -43,6 +44,8 @@ VOICE = env("TTS_VOICE", "en-US-AndrewNeural")
 RATE = env("TTS_RATE", "+0%")  # rate dasar Edge TTS, mis. "+5%"
 MAX_SPEEDUP = max(1.0, min(float(env("MAX_SPEEDUP", "1.5")), 2.0))
 KEEP_ORIG = float(env("KEEP_ORIGINAL_VOLUME", "0"))
+BURN_SUBS = env("BURN_SUBTITLES", "true").lower() in ("1", "true", "yes")
+SUB_FONT_SIZE = env("SUBTITLE_FONT_SIZE")  # kosong = otomatis (landscape 16, portrait 12)
 CPS = float(env("CHARS_PER_SEC", "14"))  # estimasi karakter/detik TTS inggris
 SHORTEN_RATIO = 1.2  # jika audio > slot * 1.2 -> minta LLM mempersingkat dulu
 SR = 24000  # sample rate audio dubbing
@@ -68,6 +71,13 @@ def has_audio(path) -> bool:
     out = run(["ffprobe", "-v", "error", "-select_streams", "a",
                "-show_entries", "stream=index", "-of", "csv=p=0", path])
     return bool(out.strip())
+
+
+def probe_size(path):
+    out = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path])
+    w, h = out.strip().split("x")[:2]
+    return int(w), int(h)
 
 
 def wav_duration(path) -> float:
@@ -329,14 +339,28 @@ def assemble(segs, clips, video_dur):
     return out_path, cursor / SR, placed
 
 
-def mux(dub_wav: Path, dub_dur: float, video_dur: float):
+def subtitle_style() -> str:
+    w, h = probe_size(VIDEO)
+    size = SUB_FONT_SIZE or ("12" if h > w else "16")
+    return (f"FontName=DejaVu Sans,FontSize={size},Bold=1,PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=18")
+
+
+def mux(dub_wav: Path, dub_dur: float, video_dur: float, srt: Path = None):
     out = OUT / "dubbed.mp4"
     extend = dub_dur - video_dur  # audio lebih panjang dari video?
-    fc = []
+    chain = []
 
     if extend > 0.3:
         print(f"[mux] audio lebih panjang {extend:.2f}s -> video diperpanjang (freeze frame terakhir)")
-        fc.append(f"[0:v]tpad=stop_mode=clone:stop_duration={extend:.3f}[v]")
+        chain.append(f"tpad=stop_mode=clone:stop_duration={extend:.3f}")
+    if srt is not None:
+        print("[mux] burn subtitle bahasa Inggris ke video")
+        chain.append(f"subtitles={srt}:force_style='{subtitle_style()}'")
+
+    fc = []
+    if chain:  # filter video -> wajib re-encode
+        fc.append("[0:v]" + ",".join(chain) + "[v]")
         vmap = "[v]"
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
     else:
@@ -366,11 +390,32 @@ def ts(t: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def write_srt(placed):
-    lines = []
-    for i, p in enumerate(placed, 1):
-        lines += [str(i), f"{ts(p['start'])} --> {ts(p['end'])}", p["text"], ""]
-    (OUT / "dubbed.en.srt").write_text("\n".join(lines), encoding="utf-8")
+def split_cues(p: dict, width: int):
+    """Pecah teks panjang jadi cue maks 2 baris; durasi dibagi proporsional."""
+    text = " ".join(p["text"].split())
+    lines = textwrap.wrap(text, width=width) or [text]
+    groups = [lines[i:i + 2] for i in range(0, len(lines), 2)]
+    total = sum(len(" ".join(g)) for g in groups) or 1
+    dur = p["end"] - p["start"]
+    cues, t = [], p["start"]
+    for g in groups:
+        share = len(" ".join(g)) / total * dur
+        cues.append((t, t + share, "\n".join(g)))
+        t += share
+    return cues
+
+
+def write_srt(placed) -> Path:
+    w, h = probe_size(VIDEO)
+    width = 26 if h > w else 42  # karakter per baris (portrait vs landscape)
+    lines, n = [], 0
+    for p in placed:
+        for start, end, text in split_cues(p, width):
+            n += 1
+            lines += [str(n), f"{ts(start)} --> {ts(end)}", text, ""]
+    path = OUT / "dubbed.en.srt"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 # ----------------------------------------------------------------- main
@@ -402,8 +447,8 @@ def main():
     dub_wav, dub_dur, placed = assemble(segs, clips, video_dur)
     print(f"[assemble] audio dubbing {dub_dur:.1f}s vs video {video_dur:.1f}s")
 
-    mux(dub_wav, dub_dur, video_dur)
-    write_srt(placed)
+    srt = write_srt(placed)
+    mux(dub_wav, dub_dur, video_dur, srt if BURN_SUBS else None)
     (OUT / "segments.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
     print("[done] output/dubbed.mp4, dubbed.en.srt, dub.wav, segments.json")

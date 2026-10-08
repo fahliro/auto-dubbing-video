@@ -34,6 +34,16 @@ on:
         required: false
         default: "1.5"
         type: string
+      burn_subtitles:
+        description: "Tempel subtitle bahasa Inggris ke dalam video (hardcode)"
+        required: false
+        default: true
+        type: boolean
+      subtitle_font_size:
+        description: "Ukuran font subtitle (kosong = otomatis)"
+        required: false
+        default: ""
+        type: string
       keep_original_volume:
         description: "Volume audio asli sebagai background (0 = dimatikan, mis. 0.1)"
         required: false
@@ -58,7 +68,7 @@ jobs:
       - name: Install ffmpeg
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
           ffmpeg -version | head -n 1
 
       - name: Install Python dependencies
@@ -90,6 +100,8 @@ jobs:
           TTS_VOICE: ${{ inputs.voice }}
           MAX_SPEEDUP: ${{ inputs.max_speedup }}
           KEEP_ORIGINAL_VOLUME: ${{ inputs.keep_original_volume }}
+          BURN_SUBTITLES: ${{ inputs.burn_subtitles }}
+          SUBTITLE_FONT_SIZE: ${{ inputs.subtitle_font_size }}
         run: python scripts/dub.py
 
       - name: Upload hasil
