@@ -343,7 +343,7 @@ def subtitle_style() -> str:
     w, h = probe_size(VIDEO)
     size = SUB_FONT_SIZE or ("12" if h > w else "16")
     return (f"FontName=DejaVu Sans,FontSize={size},Bold=1,PrimaryColour=&H00FFFFFF,"
-            "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=18")
+            "OutlineColour=&H00000000,BorderStyle=1,Outline=1,Shadow=0,Alignment=2,MarginV=18")
 
 
 def mux(dub_wav: Path, dub_dur: float, video_dur: float, srt: Path = None):
