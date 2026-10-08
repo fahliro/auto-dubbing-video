@@ -1,0 +1,100 @@
+name: Auto Dub (ID -> EN)
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "URL langsung ke file video (mp4/mov/mkv). Kosongkan jika pakai video_path"
+        required: false
+        type: string
+      video_path:
+        description: "Path video di dalam repo (mis. input/video.mp4)"
+        required: false
+        type: string
+      voice:
+        description: "Edge TTS voice"
+        required: false
+        default: "en-US-AndrewNeural"
+        type: string
+      stt_model:
+        description: "Model Whisper di Groq"
+        required: false
+        default: "whisper-large-v3"
+        type: choice
+        options:
+          - whisper-large-v3
+          - whisper-large-v3-turbo
+      llm_model:
+        description: "Model LLM untuk terjemahan (OpenAI-compatible)"
+        required: false
+        default: "gpt-4o-mini"
+        type: string
+      max_speedup:
+        description: "Batas maksimal percepatan audio dubbing (1.0 - 2.0)"
+        required: false
+        default: "1.5"
+        type: string
+      keep_original_volume:
+        description: "Volume audio asli sebagai background (0 = dimatikan, mis. 0.1)"
+        required: false
+        default: "0"
+        type: string
+
+jobs:
+  dub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
+
+      - name: Install Python dependencies
+        run: pip install -U -r requirements.txt
+
+      - name: Siapkan video input
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          VIDEO_PATH: ${{ inputs.video_path }}
+        run: |
+          mkdir -p input
+          if [ -n "$VIDEO_URL" ]; then
+            curl -L --fail --retry 3 -o input/source_video "$VIDEO_URL"
+            echo "VIDEO_FILE=input/source_video" >> "$GITHUB_ENV"
+          elif [ -n "$VIDEO_PATH" ]; then
+            test -f "$VIDEO_PATH" || { echo "File $VIDEO_PATH tidak ditemukan"; exit 1; }
+            echo "VIDEO_FILE=$VIDEO_PATH" >> "$GITHUB_ENV"
+          else
+            echo "Isi video_url atau video_path"; exit 1
+          fi
+
+      - name: Jalankan auto dubbing
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}   # mis. https://api.openai.com/v1
+          LLM_MODEL: ${{ inputs.llm_model }}
+          STT_MODEL: ${{ inputs.stt_model }}
+          TTS_VOICE: ${{ inputs.voice }}
+          MAX_SPEEDUP: ${{ inputs.max_speedup }}
+          KEEP_ORIGINAL_VOLUME: ${{ inputs.keep_original_volume }}
+        run: python scripts/dub.py
+
+      - name: Upload hasil
+        uses: actions/upload-artifact@v4
+        with:
+          name: dubbed-video
+          path: output/
+          retention-days: 7
