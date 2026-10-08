@@ -10,6 +10,7 @@ on:
       video_path:
         description: "Path video di dalam repo (mis. input/video.mp4)"
         required: false
+        default: "input/video.mp4"
         type: string
       voice:
         description: "Edge TTS voice"
@@ -27,7 +28,7 @@ on:
       llm_model:
         description: "Model LLM untuk terjemahan (OpenAI-compatible)"
         required: false
-        default: "gpt-4o-mini"
+        default: "kilo-auto/free"
         type: string
       max_speedup:
         description: "Batas maksimal percepatan audio dubbing (1.0 - 2.0)"
