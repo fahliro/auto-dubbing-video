@@ -3,11 +3,19 @@
 
 Pipeline:
   video -> ffmpeg (extract audio) -> Groq Whisper (segments + timestamp)
-        -> LLM (translate, dubbing-friendly) -> Edge TTS (per segment)
+        -> LLM (translate, dubbing-friendly) -> TTS (per segment)
         -> ffmpeg (trim silence, shorten text / speed up if too long)
         -> assemble timeline -> mux ke video (extend video jika audio masih lebih panjang)
+
+TTS provider (env TTS_PROVIDER):
+  groq  -> Groq Orpheus. Default: andal dari GitHub Actions karena Microsoft
+           memblokir IP datacenter runner dengan 403. Butuh GROQ_API_KEY.
+  auto  -> coba Edge TTS dulu; kalau kena 403, otomatis pindah ke Groq Orpheus
+           untuk SEMUA segmen sisanya.
+  edge  -> paksa Edge TTS saja (gagal keras kalau IP runner diblokir)
 """
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -18,9 +26,11 @@ import time
 import wave
 from pathlib import Path
 
-import edge_tts
 import requests
 from openai import OpenAI
+
+# edge_tts diimpor lazy di dalam _edge_once(): kalau TTS_PROVIDER=groq, run tidak
+# boleh gagal hanya karena paket edge-tts bermasalah.
 
 
 # ----------------------------------------------------------------- config
@@ -50,6 +60,23 @@ CPS = float(env("CHARS_PER_SEC", "14"))  # estimasi karakter/detik TTS inggris
 SHORTEN_RATIO = 1.2  # jika audio > slot * 1.2 -> minta LLM mempersingkat dulu
 SR = 24000  # sample rate audio dubbing
 
+# --- TTS provider -------------------------------------------------------
+TTS_PROVIDER = env("TTS_PROVIDER", "groq").lower()     # groq | auto | edge
+TTS_TIMEOUT = float(env("TTS_TIMEOUT", "90"))           # detik, per percobaan
+TTS_CONCURRENCY = max(1, int(env("TTS_CONCURRENCY", "4")))
+EDGE_TRIES = max(1, int(env("EDGE_TRIES", "3")))        # 403 = permanen, jangan 5x
+GROQ_TRIES = max(1, int(env("GROQ_TRIES", "4")))
+
+GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
+GROQ_TTS_MODEL = env("TTS_GROQ_MODEL", "canopylabs/orpheus-v1-english")
+GROQ_TTS_VOICE = env("TTS_GROQ_VOICE", "troy")
+# Orpheus: input maks 200 karakter. Pakai 190 supaya aman dari selisih hitung.
+GROQ_CHAR_LIMIT = max(50, int(env("TTS_GROQ_CHAR_LIMIT", "190")))
+
+# Di-set True begitu Edge TTS balas 403 -> sisa segmen langsung pakai Groq.
+_EDGE_BLOCKED = False
+_ACTIVE_PROVIDER = "?"
+
 llm = None  # di-init di main()
 
 
@@ -58,6 +85,24 @@ def run(cmd):
     p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
     if p.returncode != 0:
         sys.exit(f"Command gagal: {' '.join(map(str, cmd))}\n{p.stderr[-2000:]}")
+    return p.stdout
+
+
+class FFmpegError(RuntimeError):
+    """Kegagalan ffmpeg yang dilempar sebagai exception biasa.
+
+    Wajib dipakai di kode yang jalan dalam thread/async (to_wav, _concat_wav).
+    `sys.exit()` di dalam thread hanya melempar SystemExit yang tidak bisa
+    ditangkap `except Exception`, sehingga lolos dari logika retry/fallback TTS.
+    """
+
+
+def run_cmd(cmd):
+    """Seperti run(), tapi raise RuntimeError (bukan sys.exit) -> aman di thread."""
+    p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise FFmpegError(
+            f"Command gagal: {' '.join(map(str, cmd))}\n{p.stderr[-1500:]}")
     return p.stdout
 
 
@@ -83,6 +128,14 @@ def probe_size(path):
 def wav_duration(path) -> float:
     with wave.open(str(path)) as w:
         return w.getnframes() / w.getframerate()
+
+
+def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 # ----------------------------------------------------------------- 1. STT
@@ -140,7 +193,7 @@ def merge_short(segs, min_dur=1.0, max_gap=0.4, max_len=12.0):
             p = out[-1]
             if ((p["end"] - p["start"]) < min_dur
                     and (s["start"] - p["end"]) < max_gap
-                    and (s["end"] - p["start"]) < max_len):
+                    and (p["end"] - p["start"]) < max_len):
                 p["end"] = s["end"]
                 p["src"] += " " + s["src"]
                 continue
@@ -241,40 +294,225 @@ TRIM = ("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,
 
 
 def to_wav(src: Path, dst: Path, tempo: float = 1.0):
-    """mp3 -> wav mono 24k, trim silence di ujung, opsional percepat (atempo)."""
+    """audio (mp3/wav) -> wav mono 24k, trim silence di ujung, opsional percepat (atempo).
+
+    Dipanggil dari asyncio.to_thread, jadi pakai run_cmd (raise) bukan run (sys.exit):
+    SystemExit di dalam thread tidak tertangkap `except Exception`, sehingga akan
+    menembus logika retry/fallback TTS.
+
+    Ekstensi src sengaja generik (.audio): ffmpeg mendeteksi format dari ISI file,
+    jadi mp3 dari Edge TTS maupun wav dari Groq sama-sama terbaca.
+    """
     f = TRIM + (f",atempo={tempo:.4f}" if tempo > 1.0 else "")
-    run(["ffmpeg", "-y", "-i", src, "-af", f, "-ar", SR, "-ac", 1,
-         "-c:a", "pcm_s16le", dst])
+    run_cmd(["ffmpeg", "-y", "-i", src, "-af", f, "-ar", SR, "-ac", 1,
+             "-c:a", "pcm_s16le", dst])
     if wav_duration(dst) < 0.05:  # fallback bila trim menghabiskan semua audio
         f = f"atempo={tempo:.4f}" if tempo > 1.0 else "anull"
-        run(["ffmpeg", "-y", "-i", src, "-af", f, "-ar", SR, "-ac", 1,
-             "-c:a", "pcm_s16le", dst])
+        run_cmd(["ffmpeg", "-y", "-i", src, "-af", f, "-ar", SR, "-ac", 1,
+                 "-c:a", "pcm_s16le", dst])
 
 
-async def tts(text: str, out: Path, sem: asyncio.Semaphore):
+class TTSBlocked(RuntimeError):
+    """Provider menolak secara permanen (mis. 403 karena IP datacenter diblok)."""
+
+
+def _is_blocked(err: BaseException) -> bool:
+    s = f"{type(err).__name__}: {err}"
+    return ("403" in s or "Invalid response status" in s
+            or "WSServerHandshakeError" in s or "Forbidden" in s)
+
+
+# --- provider: Edge TTS --------------------------------------------------
+async def _edge_once(text: str, out: Path):
+    import edge_tts  # lazy: tidak dibutuhkan saat TTS_PROVIDER=groq
+    await edge_tts.Communicate(text, VOICE, rate=RATE).save(str(out))
+
+
+# --- provider: Groq Orpheus ---------------------------------------------
+def split_chunks(text: str, limit: int = GROQ_CHAR_LIMIT):
+    """Pecah teks jadi <= `limit` karakter, utamakan batas kalimat lalu spasi.
+
+    Orpheus menolak input > 200 karakter, jadi segmen panjang wajib dipecah.
+    """
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return [text] if text else []
+    out, cur = [], ""
+    for sent in re.split(r"(?<=[.!?])\s+", text):
+        sent = sent.strip()
+        while len(sent) > limit:            # satu kalimat pun kepanjangan -> potong paksa
+            cut = sent.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(sent[:cut].strip())
+            sent = sent[cut:].strip()
+        if not sent:
+            continue
+        if cur and len(cur) + 1 + len(sent) > limit:
+            out.append(cur)
+            cur = sent
+        else:
+            cur = f"{cur} {sent}".strip()
+    if cur:
+        out.append(cur)
+    return out or [text[:limit]]
+
+
+def _concat_wav(parts, out: Path):
+    """Gabung beberapa wav jadi satu.
+
+    `-f wav` WAJIB eksplisit: `out` berekstensi .audio dan ffmpeg menolak menebak
+    muxer dari ekstensi tak dikenal ("Unable to choose an output format").
+    Re-encode ke 24k mono sekaligus menormalkan parameter antar-chunk.
+    """
+    lst = out.parent / (out.stem + ".concat.txt")
+    lst.write_text("".join(f"file '{p.resolve()}'\n" for p in parts), encoding="utf-8")
+    try:
+        run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                 "-f", "wav", "-ar", str(SR), "-ac", "1", "-c:a", "pcm_s16le", out])
+    finally:
+        lst.unlink(missing_ok=True)
+
+
+def _groq_once(text: str, out: Path):
+    """POST ke Groq audio/speech. Output WAV; kalau teks dipecah, hasil di-concat."""
+    if not GROQ_KEY:
+        raise TTSBlocked("GROQ_API_KEY kosong, tidak bisa fallback ke Groq TTS")
+    chunks = split_chunks(text) or [""]
+    parts = []
+    try:
+        for n, ch in enumerate(chunks):
+            r = requests.post(
+                GROQ_TTS_URL,
+                headers={"Authorization": f"Bearer {GROQ_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": GROQ_TTS_MODEL, "voice": GROQ_TTS_VOICE,
+                      "input": ch, "response_format": "wav"},
+                timeout=180,
+            )
+            if r.status_code in (401, 403):
+                raise TTSBlocked(f"Groq TTS {r.status_code}: {r.text[:200]}")
+            if r.status_code == 429 or r.status_code >= 500:
+                raise RuntimeError(f"Groq TTS {r.status_code}: {r.text[:200]}")
+            r.raise_for_status()
+            p = out.parent / f"{out.stem}.part{n}.wav"
+            p.write_bytes(r.content)
+            parts.append(p)
+        if not parts:
+            raise RuntimeError("Groq TTS tidak menghasilkan audio")
+        if len(parts) == 1:
+            parts[0].replace(out)
+            parts = []
+        else:
+            _concat_wav(parts, out)
+    finally:
+        for p in parts:
+            p.unlink(missing_ok=True)
+
+
+# --- dispatcher ----------------------------------------------------------
+def _provider_chain():
+    """Urutan provider yang boleh dicoba untuk segmen ini."""
+    if TTS_PROVIDER == "edge":
+        return ["edge"]
+    if TTS_PROVIDER == "groq":
+        return ["groq"]
+    chain = []
+    if not _EDGE_BLOCKED:
+        chain.append("edge")
+    if GROQ_KEY:
+        chain.append("groq")
+    return chain or ["edge"]
+
+
+async def tts(text: str, out: Path, sem: asyncio.Semaphore) -> str:
+    """Generate TTS ke `out`. Return nama provider yang berhasil."""
+    global _EDGE_BLOCKED, _ACTIVE_PROVIDER
     async with sem:
+        chain = _provider_chain()
         last = None
-        for attempt in range(5):
-            try:
-                await edge_tts.Communicate(text, VOICE, rate=RATE).save(str(out))
-                if out.exists() and out.stat().st_size > 0:
-                    return
-            except Exception as e:  # noqa: BLE001
-                last = e
-            await asyncio.sleep(2 * (attempt + 1))
-        raise RuntimeError(f"Edge TTS gagal untuk: {text!r} ({last})")
+        for prov in chain:
+            tries = EDGE_TRIES if prov == "edge" else GROQ_TRIES
+            for attempt in range(tries):
+                try:
+                    if prov == "edge":
+                        coro = _edge_once(text, out)
+                    else:
+                        coro = asyncio.to_thread(_groq_once, text, out)
+                    # wait_for: websocket yang menggantung tidak boleh memblokir selamanya
+                    await asyncio.wait_for(coro, timeout=TTS_TIMEOUT)
+                    if out.exists() and out.stat().st_size > 0:
+                        if prov != _ACTIVE_PROVIDER:
+                            if _ACTIVE_PROVIDER != "?":
+                                print(f"[tts] provider aktif -> {prov}")
+                            _ACTIVE_PROVIDER = prov
+                        return prov
+                    last = RuntimeError("hasil TTS kosong")
+                except asyncio.TimeoutError as e:
+                    last = RuntimeError(f"timeout >{TTS_TIMEOUT:.0f}s")
+                except Exception as e:  # noqa: BLE001
+                    last = e
+                    if prov == "edge" and _is_blocked(e):
+                        # 403 = permanen untuk IP ini. Jangan buang 30s x N segmen.
+                        if not _EDGE_BLOCKED:
+                            _EDGE_BLOCKED = True
+                            fallback = "groq" if GROQ_KEY else "(tidak ada)"
+                            print(f"[tts] Edge TTS diblok (403 / IP datacenter). "
+                                  f"Pindah permanen ke: {fallback}")
+                        break  # keluar dari loop retry, lanjut ke provider berikutnya
+                    if isinstance(e, TTSBlocked):
+                        break
+                if attempt < tries - 1:
+                    await asyncio.sleep(min(2 * (attempt + 1), 10))
+        raise RuntimeError(f"TTS gagal untuk: {text!r} via {chain} ({last})")
+
+
+async def preflight_tts():
+    """Tes provider SEBELUM menghabiskan kuota Groq STT + LLM translate.
+
+    Tanpa ini, run baru ketahuan TTS-nya mati setelah 3-5 menit dan setelah
+    40-92 segmen Whisper + terjemahan terbuang.
+    """
+    global _ACTIVE_PROVIDER
+    probe = WORK / "_preflight.audio"
+    sem = asyncio.Semaphore(1)
+    t0 = time.time()
+    try:
+        prov = await asyncio.wait_for(
+            tts("Preflight check for the dubbing pipeline.", probe, sem),
+            timeout=TTS_TIMEOUT * 2 + 30)
+        print(f"[preflight] TTS OK via {prov} dalam {time.time() - t0:.1f}s")
+        _ACTIVE_PROVIDER = prov
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"[preflight] Semua provider TTS gagal ({_provider_chain()}): {e}\n"
+                 "Edge TTS 403 = IP runner diblok Microsoft. Set TTS_PROVIDER=groq "
+                 "dan pastikan GROQ_API_KEY terisi, atau pakai proxy/self-hosted runner.")
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 async def build_clip(i: int, seg: dict, sem: asyncio.Semaphore):
-    mp3 = WORK / f"tts_{i:04d}.mp3"
+    aud = WORK / f"tts_{i:04d}.audio"   # mp3 (edge) atau wav (groq); ffmpeg sniff isi
     wav = WORK / f"clip_{i:04d}.wav"
+    tag = WORK / f"tts_{i:04d}.txt"     # isi = teks yang dipakai -> invalidasi cache
     slot = seg["slot"]
     text = seg["en"]
 
-    await tts(text, mp3, sem)
-    await asyncio.to_thread(to_wav, mp3, wav)
+    def cached(t: str) -> bool:
+        return (aud.exists() and aud.stat().st_size > 0
+                and tag.exists() and tag.read_text(encoding="utf-8") == t)
+
+    if cached(text):
+        prov = "cache"
+    else:
+        prov = await tts(text, aud, sem)
+        tag.write_text(text, encoding="utf-8")
+    await asyncio.to_thread(to_wav, aud, wav)
     dur = wav_duration(wav)
-    info = "ok"
+    info = prov
 
     # 1) Terlalu panjang -> minta LLM mempersingkat, lalu generate ulang
     if dur > slot * SHORTEN_RATIO:
@@ -282,17 +520,19 @@ async def build_clip(i: int, seg: dict, sem: asyncio.Semaphore):
         new_text = await asyncio.to_thread(shorten, text, target)
         if new_text and new_text != text:
             text = new_text
-            await tts(text, mp3, sem)
-            await asyncio.to_thread(to_wav, mp3, wav)
+            if not cached(text):
+                prov = await tts(text, aud, sem)
+                tag.write_text(text, encoding="utf-8")
+            await asyncio.to_thread(to_wav, aud, wav)
             dur = wav_duration(wav)
-            info = "shortened"
+            info = f"{prov}+shortened"
 
     # 2) Masih lebih panjang dari slot -> percepat (atempo), dibatasi MAX_SPEEDUP
     tempo = 1.0
     if dur > slot:
         tempo = min(dur / slot, MAX_SPEEDUP)
         if tempo > 1.02:
-            await asyncio.to_thread(to_wav, mp3, wav, tempo)
+            await asyncio.to_thread(to_wav, aud, wav, tempo)
             dur = wav_duration(wav)
             info += f"+x{tempo:.2f}"
 
@@ -306,8 +546,32 @@ async def build_clip(i: int, seg: dict, sem: asyncio.Semaphore):
 
 
 async def build_all(segs):
-    sem = asyncio.Semaphore(4)
-    return await asyncio.gather(*(build_clip(i, s, sem) for i, s in enumerate(segs)))
+    sem = asyncio.Semaphore(TTS_CONCURRENCY)
+    # return_exceptions: satu segmen rusak tidak boleh membuang puluhan segmen
+    # yang sudah berhasil (perilaku lama: gather abort -> semua kerja hilang).
+    res = await asyncio.gather(*(build_clip(i, s, sem) for i, s in enumerate(segs)),
+                               return_exceptions=True)
+    failed = [(i, r) for i, r in enumerate(res) if isinstance(r, BaseException)]
+    if failed:
+        OUT.mkdir(exist_ok=True)
+        detail = [{"idx": i,
+                   "en": segs[i].get("en"),
+                   "slot": round(segs[i].get("slot", 0), 2),
+                   "error": f"{type(r).__name__}: {r}"} for i, r in failed]
+        (OUT / "tts_failures.json").write_text(
+            json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n[tts] GAGAL {len(failed)}/{len(segs)} segmen. "
+              f"Provider terakhir: {_ACTIVE_PROVIDER}")
+        for i, r in failed[:8]:
+            print(f"  #{i:04d}: {type(r).__name__}: {str(r)[:180]}")
+        if len(failed) > 8:
+            print(f"  ... dan {len(failed) - 8} lainnya")
+        print("  detail lengkap: output/tts_failures.json")
+        if _EDGE_BLOCKED and not GROQ_KEY:
+            print("  HINT: Edge TTS kena 403 (IP runner diblok) dan GROQ_API_KEY kosong. "
+                  "Set secret GROQ_API_KEY agar fallback aktif.")
+        raise SystemExit(2)
+    return res
 
 
 # ----------------------------------------------------------------- 4. assemble + mux
@@ -418,6 +682,39 @@ def write_srt(placed) -> Path:
     return path
 
 
+# ----------------------------------------------------------------- 5. cache STT+translate
+STATE = WORK / "state.json"
+
+
+def load_state(video_sha: str):
+    """Kembalikan segmen hasil run sebelumnya kalau video & modelnya sama persis."""
+    if not STATE.exists():
+        return None
+    try:
+        st = json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[cache] state.json tidak bisa dibaca, hitung ulang ({e})")
+        return None
+    if (st.get("video_sha") == video_sha
+            and st.get("stt_model") == STT_MODEL
+            and st.get("llm_model") == LLM_MODEL
+            and isinstance(st.get("segments"), list) and st["segments"]
+            and all(s.get("en") for s in st["segments"])):
+        return st["segments"]
+    print("[cache] state.json tidak cocok (video/model beda) -> hitung ulang")
+    return None
+
+
+def save_state(video_sha: str, segs):
+    STATE.write_text(json.dumps({
+        "video_sha": video_sha,
+        "stt_model": STT_MODEL,
+        "llm_model": LLM_MODEL,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "segments": segs,
+    }, ensure_ascii=False), encoding="utf-8")
+
+
 # ----------------------------------------------------------------- main
 def main():
     global llm
@@ -433,25 +730,44 @@ def main():
     OUT.mkdir(exist_ok=True)
 
     video_dur = probe_duration(VIDEO)
-    print(f"[init] video {video_dur:.1f}s, voice={VOICE}, max_speedup={MAX_SPEEDUP}")
+    print(f"[init] video {video_dur:.1f}s, provider={TTS_PROVIDER}, "
+          f"edge_voice={VOICE}, groq_voice={GROQ_TTS_VOICE}, max_speedup={MAX_SPEEDUP}")
 
-    segs = transcribe()
-    if not segs:
-        sys.exit("Tidak ada ucapan terdeteksi")
-    print(f"[stt] {len(segs)} segmen")
+    video_sha = sha256_file(VIDEO)
+    print(f"[init] sha256 video {video_sha[:16]}...")
 
-    compute_slots(segs, video_dur)
-    translate(segs)
+    # 0) Cek TTS dulu: murah (~2 detik), hemat kuota Groq+LLM kalau ternyata mati.
+    asyncio.run(preflight_tts())
 
+    # 1-2) STT + translate (di-cache antar run untuk video yang sama)
+    segs = load_state(video_sha)
+    if segs is not None:
+        print(f"[cache] pakai ulang hasil STT+translate: {len(segs)} segmen "
+              "(skip Groq Whisper & LLM)")
+        compute_slots(segs, video_dur)
+    else:
+        segs = transcribe()
+        if not segs:
+            sys.exit("Tidak ada ucapan terdeteksi")
+        print(f"[stt] {len(segs)} segmen")
+        compute_slots(segs, video_dur)
+        translate(segs)
+        save_state(video_sha, segs)
+
+    # 3) TTS
     clips = asyncio.run(build_all(segs))
+
+    # 4) assemble + mux
     dub_wav, dub_dur, placed = assemble(segs, clips, video_dur)
     print(f"[assemble] audio dubbing {dub_dur:.1f}s vs video {video_dur:.1f}s")
 
     srt = write_srt(placed)
     mux(dub_wav, dub_dur, video_dur, srt if BURN_SUBS else None)
+    save_state(video_sha, segs)  # teks final (mungkin sudah di-shorten)
     (OUT / "segments.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("[done] output/dubbed.mp4, dubbed.en.srt, dub.wav, segments.json")
+    print(f"[done] output/dubbed.mp4, dubbed.en.srt, dub.wav, segments.json "
+          f"(TTS provider: {_ACTIVE_PROVIDER})")
 
 
 if __name__ == "__main__":

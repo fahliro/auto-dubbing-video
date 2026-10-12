@@ -1,3 +1,18 @@
-edge-tts>=7.0.0
-openai>=1.40.0
-requests>=2.31.0
+# edge-tts 7.2.8 = versi terakhir yang tahu cara membuat token Sec-MS-GEC
+# dengan Sec-MS-GEC-Version=1-143.0.3650.75.
+#
+# PENTING: 403 "Invalid response status" dari speech.platform.bing.com biasanya
+# BUKAN soal versi -- Microsoft memblokir berdasarkan IP asal. Runner GitHub
+# Actions (range Azure) termasuk yang diblokir. Bump versi saja tidak menolong;
+# pakai TTS_PROVIDER=groq sebagai fallback (lihat scripts/dub.py).
+#
+# `pip install -U` di workflow tetap memaksa versi terbaru, jadi kalau suatu saat
+# Microsoft menaikkan versi Chromium minimum dan edge-tts merilis update,
+# build otomatis ikut terangkat.
+edge-tts>=7.2.8
+
+# openai 3.x sudah dipakai di run yang sukses; batas <4 supaya tidak ada
+# breaking change mayor yang lolos diam-diam.
+openai>=1.40.0,<4
+
+requests>=2.31.0,<3
