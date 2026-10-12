@@ -22,7 +22,9 @@ import re
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -61,21 +63,38 @@ SHORTEN_RATIO = 1.2  # jika audio > slot * 1.2 -> minta LLM mempersingkat dulu
 SR = 24000  # sample rate audio dubbing
 
 # --- TTS provider -------------------------------------------------------
-TTS_PROVIDER = env("TTS_PROVIDER", "groq").lower()     # groq | auto | edge
+TTS_PROVIDER = env("TTS_PROVIDER", "piper").lower()    # piper | groq | auto | edge
 TTS_TIMEOUT = float(env("TTS_TIMEOUT", "90"))           # detik, per percobaan
 TTS_CONCURRENCY = max(1, int(env("TTS_CONCURRENCY", "4")))
 EDGE_TRIES = max(1, int(env("EDGE_TRIES", "3")))        # 403 = permanen, jangan 5x
 GROQ_TRIES = max(1, int(env("GROQ_TRIES", "4")))
+PIPER_TRIES = max(1, int(env("PIPER_TRIES", "2")))     # lokal, jarang gagal
 
 GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
 GROQ_TTS_MODEL = env("TTS_GROQ_MODEL", "canopylabs/orpheus-v1-english")
 GROQ_TTS_VOICE = env("TTS_GROQ_VOICE", "troy")
 # Orpheus: input maks 200 karakter. Pakai 190 supaya aman dari selisih hitung.
 GROQ_CHAR_LIMIT = max(50, int(env("TTS_GROQ_CHAR_LIMIT", "190")))
+# canopylabs/orpheus-v1-english di tier gratis: RPM=10, RPD=100
+# (https://console.groq.com/docs/rate-limits). Default 9 agar tidak menyentuh
+# plafon. RPD=100 artinya SATU video 92 segmen sudah menghabiskan kuota harian,
+# karena itu Piper (lokal) dijadikan default.
+GROQ_RPM = max(1, int(env("TTS_GROQ_RPM", "9")))
 
-# Di-set True begitu Edge TTS balas 403 -> sisa segmen langsung pakai Groq.
+# --- Piper TTS: lokal, offline, tanpa API key & tanpa rate limit ---------
+PIPER_VOICE = env("TTS_PIPER_VOICE", "en_US-lessac-medium")
+PIPER_DIR = Path(env("TTS_PIPER_DIR", ".piper-voices"))
+PIPER_HF_BASE = env("TTS_PIPER_HF_BASE",
+                    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0")
+# length_scale > 1 = lebih lambat, < 1 = lebih cepat. Kosong = default model.
+PIPER_LENGTH_SCALE = env("TTS_PIPER_LENGTH_SCALE")
+
+# Di-set True begitu Edge TTS balas 403 -> sisa segmen pindah provider lain.
 _EDGE_BLOCKED = False
+_GROQ_DAILY_EXHAUSTED = False   # RPD habis: retry tidak ada gunanya
 _ACTIVE_PROVIDER = "?"
+_PIPER_VOICE = None             # model Piper di-load sekali per proses
+_PIPER_LOCK = threading.Lock()
 
 llm = None  # di-init di main()
 
@@ -313,7 +332,67 @@ def to_wav(src: Path, dst: Path, tempo: float = 1.0):
 
 
 class TTSBlocked(RuntimeError):
-    """Provider menolak secara permanen (mis. 403 karena IP datacenter diblok)."""
+    """Provider menolak secara permanen -- jangan di-retry.
+
+    Contoh: Edge TTS 403 (IP datacenter diblok Microsoft), Groq 401 (key salah),
+    atau kuota harian Groq (RPD) sudah habis.
+    """
+
+
+class GroqRateLimited(RuntimeError):
+    """429 dari Groq, disertai saran durasi tunggu dalam detik."""
+
+    def __init__(self, msg: str, wait: float = 0.0):
+        super().__init__(msg)
+        self.wait = wait
+
+
+class RateLimiter:
+    """Jaga jarak antar-request supaya tidak menembus RPM provider.
+
+    Groq Orpheus tier gratis cuma 10 RPM. Tanpa pembatas ini, 92 segmen
+    ditembakkan secepat mungkin dan hasilnya 42 dari 92 segmen kena 429
+    (run 38286526459). Thread-safe karena _groq_once jalan di to_thread.
+    """
+
+    def __init__(self, rpm: int):
+        self.rpm = max(1, rpm)
+        self.interval = 60.0 / self.rpm
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = max(0.0, self._next_at - now)
+            self._next_at = max(now, self._next_at) + self.interval
+        if wait > 0:
+            time.sleep(wait)
+
+
+_GROQ_LIMITER = RateLimiter(GROQ_RPM)
+
+# Body error API dipotong sepanjang ini. Dulu 200 karakter, yang membuat URL
+# "terms acceptance" dari Groq terpotong sehingga tidak bisa ditindaklanjuti.
+ERR_BODY_LIMIT = 600
+
+
+def _err_body(r) -> str:
+    """Ambil error.message kalau responsnya JSON, kalau tidak potong body mentah."""
+    if "json" in r.headers.get("content-type", ""):
+        try:
+            return str(r.json()["error"]["message"])[:ERR_BODY_LIMIT]
+        except Exception:  # noqa: BLE001
+            pass
+    return r.text[:ERR_BODY_LIMIT]
+
+
+def _retry_after(r, default: float = 20.0) -> float:
+    """Header retry-after (detik) yang dikirim Groq saat 429."""
+    try:
+        return min(max(float(r.headers.get("retry-after", "")), 1.0), 120.0)
+    except (TypeError, ValueError):
+        return default
 
 
 def _is_blocked(err: BaseException) -> bool:
@@ -379,12 +458,16 @@ def _concat_wav(parts, out: Path):
 
 def _groq_once(text: str, out: Path):
     """POST ke Groq audio/speech. Output WAV; kalau teks dipecah, hasil di-concat."""
+    global _GROQ_DAILY_EXHAUSTED
     if not GROQ_KEY:
         raise TTSBlocked("GROQ_API_KEY kosong, tidak bisa fallback ke Groq TTS")
+    if _GROQ_DAILY_EXHAUSTED:
+        raise TTSBlocked("Kuota harian Groq (RPD) sudah habis -- lihat pesan sebelumnya")
     chunks = split_chunks(text) or [""]
     parts = []
     try:
         for n, ch in enumerate(chunks):
+            _GROQ_LIMITER.acquire()   # jaga jarak request, hormati RPM
             r = requests.post(
                 GROQ_TTS_URL,
                 headers={"Authorization": f"Bearer {GROQ_KEY}",
@@ -393,10 +476,23 @@ def _groq_once(text: str, out: Path):
                       "input": ch, "response_format": "wav"},
                 timeout=180,
             )
+            body = _err_body(r)
             if r.status_code in (401, 403):
-                raise TTSBlocked(f"Groq TTS {r.status_code}: {r.text[:200]}")
-            if r.status_code == 429 or r.status_code >= 500:
-                raise RuntimeError(f"Groq TTS {r.status_code}: {r.text[:200]}")
+                raise TTSBlocked(f"Groq TTS {r.status_code}: {body}")
+            if r.status_code == 429:
+                # x-ratelimit-remaining-requests = sisa kuota HARIAN (RPD).
+                # Kalau 0, retry sampai kapan pun tidak akan berhasil.
+                if r.headers.get("x-ratelimit-remaining-requests") == "0":
+                    _GROQ_DAILY_EXHAUSTED = True
+                    raise TTSBlocked(
+                        "Kuota harian Groq (RPD=100) habis. Orpheus tier gratis "
+                        "tidak cukup untuk video panjang: 92 segmen = 92 request. "
+                        "Pakai TTS_PROVIDER=piper (lokal, tanpa kuota), upgrade "
+                        "plan Groq, atau tunggu reset tengah malam.")
+                wait = _retry_after(r)
+                raise GroqRateLimited(f"Groq TTS 429: {body} (tunggu {wait:.0f}s)", wait)
+            if r.status_code >= 500:
+                raise RuntimeError(f"Groq TTS {r.status_code}: {body}")
             r.raise_for_status()
             p = out.parent / f"{out.stem}.part{n}.wav"
             p.write_bytes(r.content)
@@ -413,19 +509,104 @@ def _groq_once(text: str, out: Path):
             p.unlink(missing_ok=True)
 
 
+# --- provider: Piper TTS (lokal, offline, tanpa kuota) -------------------
+def _piper_ensure_model(name: str) -> Path:
+    """Pastikan model suara Piper tersedia; download dari HuggingFace kalau belum.
+
+    `name` boleh "en_US-lessac-medium" (di-download ke PIPER_DIR) atau path
+    langsung ke file .onnx. File konfigurasi .onnx.json di-load otomatis oleh
+    PiperVoice.load() dari samping file model.
+    """
+    if name.endswith(".onnx"):
+        direct = Path(name)
+        if not direct.is_file():
+            raise TTSBlocked(f"Model Piper tidak ditemukan: {direct}")
+        return direct
+
+    parts = name.split("-")
+    if len(parts) != 3:
+        raise TTSBlocked(
+            f"TTS_PIPER_VOICE '{name}' tidak valid. Format: <lang>_<US>-<nama>-"
+            f"<kualitas>, contoh en_US-lessac-medium")
+    lang, vname, quality = parts
+    family = lang.split("_")[0]
+    base = f"{PIPER_HF_BASE}/{family}/{lang}/{vname}/{quality}/{name}"
+
+    PIPER_DIR.mkdir(parents=True, exist_ok=True)
+    onnx = PIPER_DIR / f"{name}.onnx"
+    for dst, url in ((PIPER_DIR / f"{name}.onnx.json", base + ".onnx.json"),
+                     (onnx, base + ".onnx")):
+        if dst.exists() and dst.stat().st_size > 0:
+            continue
+        tmp = dst.parent / (dst.name + ".part")
+        for attempt in range(3):
+            try:
+                print(f"[piper] download {url}")
+                urllib.request.urlretrieve(url, tmp)
+                tmp.replace(dst)
+                break
+            except Exception as e:  # noqa: BLE001
+                tmp.unlink(missing_ok=True)
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"gagal download voice Piper '{name}' dari {url}: {e}") from e
+                time.sleep(3 * (attempt + 1))
+    return onnx
+
+
+def _piper_get_voice():
+    """Load model Piper sekali per proses. Thread-safe: dipanggil dari to_thread."""
+    global _PIPER_VOICE
+    if _PIPER_VOICE is None:
+        with _PIPER_LOCK:
+            if _PIPER_VOICE is None:          # double-checked locking
+                from piper import PiperVoice   # lazy: onnxruntime berat
+                onnx = _piper_ensure_model(PIPER_VOICE)
+                t0 = time.time()
+                _PIPER_VOICE = PiperVoice.load(str(onnx))
+                print(f"[piper] voice {PIPER_VOICE} siap dalam {time.time() - t0:.1f}s "
+                      f"({_PIPER_VOICE.config.sample_rate} Hz)")
+    return _PIPER_VOICE
+
+
+def _piper_once(text: str, out: Path):
+    """Sintesis lokal -> WAV. Tanpa API key, tanpa rate limit, tanpa blokir IP."""
+    from piper import SynthesisConfig
+    voice = _piper_get_voice()
+    cfg = None
+    if PIPER_LENGTH_SCALE:
+        try:
+            cfg = SynthesisConfig(length_scale=float(PIPER_LENGTH_SCALE))
+        except ValueError:
+            print(f"[piper] TTS_PIPER_LENGTH_SCALE '{PIPER_LENGTH_SCALE}' bukan angka, diabaikan")
+    tmp = out.parent / (out.stem + ".piper.part.wav")
+    with wave.open(str(tmp), "wb") as wf:
+        voice.synthesize_wav(text, wf, syn_config=cfg)
+    if not tmp.exists() or tmp.stat().st_size < 100:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("Piper menghasilkan audio kosong")
+    tmp.replace(out)
+
+
 # --- dispatcher ----------------------------------------------------------
 def _provider_chain():
     """Urutan provider yang boleh dicoba untuk segmen ini."""
-    if TTS_PROVIDER == "edge":
-        return ["edge"]
-    if TTS_PROVIDER == "groq":
-        return ["groq"]
+    if TTS_PROVIDER in ("edge", "groq", "piper"):
+        return [TTS_PROVIDER]
+    # auto: Edge (kualitas terbaik, gratis) -> Piper (lokal, selalu jalan)
+    #       -> Groq (hanya kalau ada key dan kuota harian belum habis)
     chain = []
     if not _EDGE_BLOCKED:
         chain.append("edge")
-    if GROQ_KEY:
+    chain.append("piper")
+    if GROQ_KEY and not _GROQ_DAILY_EXHAUSTED:
         chain.append("groq")
-    return chain or ["edge"]
+    return chain
+
+
+# Jeda antar percobaan (detik) per provider. Groq dibatasi per MENIT, jadi
+# backoff pendek ala Edge (2/4/6s) tidak akan pernah berhasil di sana.
+BACKOFF = {"edge": 2.0, "groq": 20.0, "piper": 1.0}
 
 
 async def tts(text: str, out: Path, sem: asyncio.Semaphore) -> str:
@@ -435,14 +616,17 @@ async def tts(text: str, out: Path, sem: asyncio.Semaphore) -> str:
         chain = _provider_chain()
         last = None
         for prov in chain:
-            tries = EDGE_TRIES if prov == "edge" else GROQ_TRIES
+            tries = {"edge": EDGE_TRIES, "groq": GROQ_TRIES,
+                     "piper": PIPER_TRIES}[prov]
             for attempt in range(tries):
                 try:
                     if prov == "edge":
                         coro = _edge_once(text, out)
-                    else:
+                    elif prov == "groq":
                         coro = asyncio.to_thread(_groq_once, text, out)
-                    # wait_for: websocket yang menggantung tidak boleh memblokir selamanya
+                    else:
+                        coro = asyncio.to_thread(_piper_once, text, out)
+                    # wait_for: koneksi yang menggantung tidak boleh memblokir selamanya
                     await asyncio.wait_for(coro, timeout=TTS_TIMEOUT)
                     if out.exists() and out.stat().st_size > 0:
                         if prov != _ACTIVE_PROVIDER:
@@ -451,22 +635,35 @@ async def tts(text: str, out: Path, sem: asyncio.Semaphore) -> str:
                             _ACTIVE_PROVIDER = prov
                         return prov
                     last = RuntimeError("hasil TTS kosong")
-                except asyncio.TimeoutError as e:
+                except asyncio.TimeoutError:
                     last = RuntimeError(f"timeout >{TTS_TIMEOUT:.0f}s")
+                except GroqRateLimited as e:
+                    # 429 sementara: tunggu sesuai retry-after dari server.
+                    last = e
+                    await asyncio.sleep(e.wait)
+                    continue
+                except TTSBlocked as e:
+                    # Permanen untuk provider ini -> jangan retry, pindah saja.
+                    last = e
+                    if prov == "edge" and not _EDGE_BLOCKED:
+                        _EDGE_BLOCKED = True
+                        sisa = chain[chain.index(prov) + 1:] or ["(tidak ada)"]
+                        print(f"[tts] Edge TTS diblok (403 / IP datacenter) "
+                              f"-> pindah permanen ke: {sisa[0]}")
+                    elif prov == "groq":
+                        print(f"[tts] Groq tidak bisa dipakai: {str(e)[:200]}")
+                    break
                 except Exception as e:  # noqa: BLE001
                     last = e
                     if prov == "edge" and _is_blocked(e):
-                        # 403 = permanen untuk IP ini. Jangan buang 30s x N segmen.
                         if not _EDGE_BLOCKED:
                             _EDGE_BLOCKED = True
-                            fallback = "groq" if GROQ_KEY else "(tidak ada)"
-                            print(f"[tts] Edge TTS diblok (403 / IP datacenter). "
-                                  f"Pindah permanen ke: {fallback}")
-                        break  # keluar dari loop retry, lanjut ke provider berikutnya
-                    if isinstance(e, TTSBlocked):
+                            sisa = chain[chain.index(prov) + 1:] or ["(tidak ada)"]
+                            print(f"[tts] Edge TTS diblok (403 / IP datacenter) "
+                                  f"-> pindah permanen ke: {sisa[0]}")
                         break
                 if attempt < tries - 1:
-                    await asyncio.sleep(min(2 * (attempt + 1), 10))
+                    await asyncio.sleep(min(BACKOFF[prov] * (attempt + 1), 60.0))
         raise RuntimeError(f"TTS gagal untuk: {text!r} via {chain} ({last})")
 
 
@@ -731,7 +928,9 @@ def main():
 
     video_dur = probe_duration(VIDEO)
     print(f"[init] video {video_dur:.1f}s, provider={TTS_PROVIDER}, "
-          f"edge_voice={VOICE}, groq_voice={GROQ_TTS_VOICE}, max_speedup={MAX_SPEEDUP}")
+          f"max_speedup={MAX_SPEEDUP}")
+    print(f"[init] piper_voice={PIPER_VOICE}, edge_voice={VOICE}, "
+          f"groq_voice={GROQ_TTS_VOICE} (model={GROQ_TTS_MODEL}, rpm={GROQ_RPM})")
 
     video_sha = sha256_file(VIDEO)
     print(f"[init] sha256 video {video_sha[:16]}...")

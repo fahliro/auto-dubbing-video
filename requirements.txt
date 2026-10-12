@@ -1,14 +1,25 @@
-# edge-tts 7.2.8 = versi terakhir yang tahu cara membuat token Sec-MS-GEC
-# dengan Sec-MS-GEC-Version=1-143.0.3650.75.
+# ---------------------------------------------------------------------------
+# TTS lokal (provider DEFAULT). Jalan sepenuhnya offline di runner: tanpa API
+# key, tanpa rate limit, tanpa terms, dan tidak bisa diblokir berdasarkan IP.
+# Butuh onnxruntime (ikut terpasang sebagai dependency) + espeak-ng-data
+# (sudah dibundel di wheel piper-tts untuk Linux).
+#
+# Ini jawaban atas dua kebuntuan sekaligus:
+#   - Edge TTS  -> 403, Microsoft memblokir IP datacenter GitHub Actions
+#   - Groq TTS  -> RPM=10, RPD=100/hari; video 92 segmen menghabiskan kuota
+piper-tts>=1.8.0
+
+# edge-tts tetap dipakai kalau TTS_PROVIDER=edge atau auto (dan Edge tidak diblokir).
 #
 # PENTING: 403 "Invalid response status" dari speech.platform.bing.com biasanya
 # BUKAN soal versi -- Microsoft memblokir berdasarkan IP asal. Runner GitHub
-# Actions (range Azure) termasuk yang diblokir. Bump versi saja tidak menolong;
-# pakai TTS_PROVIDER=groq sebagai fallback (lihat scripts/dub.py).
-#
-# `pip install -U` di workflow tetap memaksa versi terbaru, jadi kalau suatu saat
-# Microsoft menaikkan versi Chromium minimum dan edge-tts merilis update,
+# Actions (range Azure) termasuk yang diblokir. Bump versi saja tidak menolong.
+# `pip install -U` di workflow tetap memaksa versi terbaru, jadi kalau suatu
+# saat Microsoft menaikkan versi Chromium minimum dan edge-tts merilis update,
 # build otomatis ikut terangkat.
+#
+# Diimpor lazy di dub.py, jadi run dengan TTS_PROVIDER=piper tidak bergantung
+# pada paket ini sama sekali.
 edge-tts>=7.2.8
 
 # openai 3.x sudah dipakai di run yang sukses; batas <4 supaya tidak ada
