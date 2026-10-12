@@ -1,5 +1,11 @@
 name: Auto Dub (ID -> EN)
 
+# Dua run bersamaan = dua runner menghajar endpoint TTS sekaligus,
+# yang memperbesar peluang kena throttle/blokir. Antrikan saja.
+concurrency:
+  group: auto-dub-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,11 +18,44 @@ on:
         required: false
         default: "input/video.mp4"
         type: string
+      tts_provider:
+        description: "Provider TTS. 'piper' = lokal/offline (tanpa kuota & tanpa blokir IP)"
+        required: false
+        default: "piper"
+        type: choice
+        options:
+          - piper
+          - auto
+          - groq
+          - edge
+      piper_voice:
+        description: "Piper voice (lokal). *-medium cepat (RTF 0.15x); *-high lebih bagus tapi 6x lebih lambat"
+        required: false
+        default: "en_US-lessac-medium"
+        type: choice
+        options:
+          - en_US-lessac-medium
+          - en_US-amy-medium
+          - en_US-kristin-medium
+          - en_US-ryan-high
+          - en_GB-alba-medium
       voice:
-        description: "Edge TTS voice"
+        description: "Edge TTS voice (hanya dipakai kalau provider = edge/auto)"
         required: false
         default: "en-US-AndrewNeural"
         type: string
+      tts_groq_voice:
+        description: "Groq Orpheus voice (provider = groq). PERHATIAN: tier gratis cuma RPM=10, RPD=100/hari"
+        required: false
+        default: "troy"
+        type: choice
+        options:
+          - troy
+          - austin
+          - daniel
+          - autumn
+          - diana
+          - hannah
       stt_model:
         description: "Model Whisper di Groq"
         required: false
@@ -50,6 +89,11 @@ on:
         required: false
         default: "0"
         type: string
+      tts_concurrency:
+        description: "Jumlah request TTS paralel. Untuk groq biarkan 1-2 (RPM cuma 10)"
+        required: false
+        default: "4"
+        type: string
 
 jobs:
   dub:
@@ -58,10 +102,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -73,14 +117,18 @@ jobs:
           ffmpeg -version | head -n 1
 
       - name: Install Python dependencies
-        run: pip install -U -r requirements.txt
+        run: |
+          pip install -U -r requirements.txt
+          echo "--- versi terpasang ---"
+          (pip show piper-tts 2>/dev/null | head -n 2) || true
+          (pip show edge-tts 2>/dev/null | head -n 2) || true
 
       - name: Siapkan video input
         env:
           VIDEO_URL: ${{ inputs.video_url }}
           VIDEO_PATH: ${{ inputs.video_path }}
         run: |
-          mkdir -p input
+          mkdir -p input work
           if [ -n "$VIDEO_URL" ]; then
             curl -L --fail --retry 3 -o input/source_video "$VIDEO_URL"
             echo "VIDEO_FILE=input/source_video" >> "$GITHUB_ENV"
@@ -91,23 +139,116 @@ jobs:
             echo "Isi video_url atau video_path"; exit 1
           fi
 
+      # Model suara Piper (~63 MB) di-cache per nama voice, supaya tidak
+      # download ulang tiap run.
+      - name: Cache model suara Piper
+        uses: actions/cache@v6
+        with:
+          path: .piper-voices/
+          key: piper-voice-${{ inputs.piper_voice }}
+
+      # Key cache dihitung dari ISI video (bukan nama file), supaya video dari
+      # video_url tidak bentrok dengan input/video.mp4 yang ada di repo.
+      - name: Hitung cache key
+        id: cachekey
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          VIDEO_PATH: ${{ inputs.video_path }}
+        run: |
+          if [ -n "$VIDEO_URL" ]; then
+            K="url-$(printf '%s' "$VIDEO_URL" | sha256sum | cut -c1-32)"
+          else
+            K="path-$(sha256sum "$VIDEO_PATH" | cut -c1-32)"
+          fi
+          # run_attempt ikut di key agar tiap percobaan bisa menyimpan progres
+          # barunya sendiri; restore-keys mengambil progres attempt sebelumnya.
+          echo "key=dub-work-${K}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          echo "restore=dub-work-${K}-" >> "$GITHUB_OUTPUT"
+          echo "cache key: dub-work-${K}-${{ github.run_attempt }}"
+
+      # Cache hasil STT + translate + audio TTS per segmen.
+      # Efeknya: kalau run gagal di tahap akhir, re-run tidak membayar ulang
+      # kuota Groq Whisper & LLM, dan segmen yang sudah jadi tidak di-TTS ulang.
+      # Aman walau key salah: dub.py memvalidasi state.json terhadap SHA-256 video.
+      - name: Restore cache kerja
+        id: restore-work
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            work/state.json
+            work/tts_*.audio
+            work/tts_*.txt
+            work/clip_*.wav
+          key: ${{ steps.cachekey.outputs.key }}
+          restore-keys: ${{ steps.cachekey.outputs.restore }}
+
+      # Fail fast: beberapa detik, sebelum kuota Groq STT + LLM dipakai.
+      - name: Cek provider TTS
+        env:
+          TTS_PROVIDER: ${{ inputs.tts_provider }}
+          TTS_PIPER_VOICE: ${{ inputs.piper_voice }}
+          TTS_VOICE: ${{ inputs.voice }}
+          TTS_GROQ_VOICE: ${{ inputs.tts_groq_voice }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python scripts/tts_probe.py
+
       - name: Jalankan auto dubbing
         env:
+          # VIDEO_FILE sengaja tidak dideklarasikan di sini: nilai yang ditulis ke
+          # $GITHUB_ENV di step atas sudah otomatis ikut ke environment step ini.
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}   # mis. https://api.openai.com/v1
           LLM_MODEL: ${{ inputs.llm_model }}
           STT_MODEL: ${{ inputs.stt_model }}
+          TTS_PROVIDER: ${{ inputs.tts_provider }}
+          TTS_PIPER_VOICE: ${{ inputs.piper_voice }}
           TTS_VOICE: ${{ inputs.voice }}
+          TTS_GROQ_VOICE: ${{ inputs.tts_groq_voice }}
+          TTS_CONCURRENCY: ${{ inputs.tts_concurrency }}
           MAX_SPEEDUP: ${{ inputs.max_speedup }}
           KEEP_ORIGINAL_VOLUME: ${{ inputs.keep_original_volume }}
           BURN_SUBTITLES: ${{ inputs.burn_subtitles }}
           SUBTITLE_FONT_SIZE: ${{ inputs.subtitle_font_size }}
         run: python scripts/dub.py
 
+      # PENTING: simpan cache walau job GAGAL. Tanpa ini, puluhan segmen yang
+      # sudah berhasil di-TTS ikut terbuang (terjadi di run 38286526459:
+      # 50 segmen sukses hilang karena post-step actions/cache di-skip).
+      - name: Simpan cache kerja
+        if: always()
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: |
+            work/state.json
+            work/tts_*.audio
+            work/tts_*.txt
+            work/clip_*.wav
+          key: ${{ steps.cachekey.outputs.key }}
+
       - name: Upload hasil
-        uses: actions/upload-artifact@v4
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: dubbed-video
-          path: output/
+          path: |
+            output/dubbed.mp4
+            output/dubbed.en.srt
+            output/dub.wav
+            output/segments.json
           retention-days: 7
+          if-no-files-found: ignore
+
+      # Tetap upload walau gagal: berisi output/tts_failures.json untuk debugging.
+      - name: Upload bahan debug (saat gagal)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: debug-info
+          path: |
+            output/tts_failures.json
+            output/segments.json
+            work/state.json
+          retention-days: 7
+          if-no-files-found: ignore
