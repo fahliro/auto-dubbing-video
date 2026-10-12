@@ -37,6 +37,36 @@ async def probe_edge(voice: str, timeout: float = 45.0):
     return time.time() - t0, size
 
 
+# Body error Groq dipotong sepanjang ini supaya URL/instruksi di dalamnya
+# tidak terpenggal (versi lama memotong di 200 char -> URL terms acceptance hilang).
+ERR_BODY_LIMIT = 900
+
+HINTS = [
+    ("requires terms acceptance",
+     "Model ini butuh penerimaan TERMS di akun Groq Anda (sekali saja).\n"
+     "            Buka URL di bawah dengan akun pemilik GROQ_API_KEY, klik Accept,\n"
+     "            lalu re-run workflow. Tidak ada yang perlu diubah di repo."),
+    ("model_not_found",
+     "Model tidak tersedia untuk akun/key ini. Cek nama model di\n"
+     "            https://console.groq.com/docs/models dan set TTS_GROQ_MODEL."),
+    ("Invalid API Key",
+     "Secret GROQ_API_KEY tidak valid / sudah di-revoke. Perbarui di\n"
+     "            Settings > Secrets and variables > Actions."),
+    ("rate_limit",
+     "Groq rate limit. Turunkan tts_concurrency ke 2, atau tunggu sebentar."),
+    ("billing",
+     "Masalah billing/kuota di akun Groq."),
+]
+
+
+def hint_for(body: str) -> str:
+    low = body.lower()
+    for needle, msg in HINTS:
+        if needle.lower() in low:
+            return msg
+    return ""
+
+
 def probe_groq(voice: str, model: str, timeout: float = 60.0):
     key = env("GROQ_API_KEY")
     if not key:
@@ -51,7 +81,17 @@ def probe_groq(voice: str, model: str, timeout: float = 60.0):
         timeout=timeout,
     )
     if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+        ctype = r.headers.get("content-type", "")
+        body = r.text[:ERR_BODY_LIMIT]
+        if "json" in ctype:
+            # ambil field message saja kalau bisa, biar lebih enak dibaca
+            try:
+                body = r.json()["error"]["message"][:ERR_BODY_LIMIT]
+            except Exception:  # noqa: BLE001
+                pass
+        err = RuntimeError(f"HTTP {r.status_code}: {body}")
+        err.hint = hint_for(body)          # type: ignore[attr-defined]
+        raise err
     if len(r.content) < 1000:
         raise RuntimeError(f"audio terlalu kecil ({len(r.content)} bytes)")
     return time.time() - t0, len(r.content)
@@ -92,7 +132,12 @@ def main():
                 print(f"[probe] GROQ  OK   {dt:.1f}s  {size} bytes")
                 ok.append("groq")
             except Exception as e:  # noqa: BLE001
-                print(f"[probe] GROQ  gagal: {type(e).__name__}: {str(e)[:200]}")
+                print(f"[probe] GROQ  gagal: {type(e).__name__}: {e}")
+                hint = getattr(e, "hint", "")
+                if hint:
+                    print("[probe] HINT: " + hint)
+                    print("::error title=Groq TTS butuh aksi di console::"
+                          + hint.replace("\n", " ").replace("            ", ""))
 
     if ok:
         print(f"[probe] provider siap pakai: {', '.join(ok)} -> lanjut ke pipeline")
@@ -100,11 +145,16 @@ def main():
         return 0
 
     print("\n[probe] SEMUA provider TTS mati.")
-    print("  - Edge TTS 403  => Microsoft memblokir IP runner GitHub Actions.")
-    print("                    Ini di luar kendali repo; re-run biasanya tetap gagal.")
-    print("  - Solusi: set TTS_PROVIDER=groq + isi secret GROQ_API_KEY,")
-    print("            atau proxy Edge TTS lewat Cloudflare Worker,")
-    print("            atau pakai self-hosted runner dengan IP non-datacenter.")
+    print("  Kemungkinan penyebab:")
+    print("  - GROQ 400 'requires terms acceptance'")
+    print("        => terima terms model di https://console.groq.com (sekali saja),")
+    print("           lalu re-run. Ini yang paling sering terjadi.")
+    print("  - GROQ 401 'Invalid API Key' => perbarui secret GROQ_API_KEY.")
+    print("  - EDGE 403 'Invalid response status'")
+    print("        => Microsoft memblokir IP datacenter runner GitHub Actions.")
+    print("           Di luar kendali repo; re-run biasanya tetap gagal.")
+    print("           Solusi: proxy Edge TTS lewat Cloudflare Worker, atau")
+    print("           self-hosted runner dengan IP non-datacenter.")
     print("::error::Semua provider TTS gagal. Lihat log step 'Cek provider TTS'.")
     return 1
 
