@@ -111,9 +111,9 @@ on:
         default: "0"
         type: string
       tts_concurrency:
-        description: "Jumlah sintesis Piper paralel (lokal, tidak ada rate limit)"
+        description: "Jumlah sintesis paralel. KOSONGKAN = otomatis (piper 4, kokoro 2). Jangan set 4 untuk kokoro: terukur 3x lebih lambat di 2 vCPU"
         required: false
-        default: "4"
+        default: ""
         type: string
 
 jobs:

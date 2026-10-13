@@ -115,7 +115,20 @@ KOKORO_MAX_CHARS = max(100, int(env("TTS_KOKORO_MAX_CHARS", "500")))
 # Kokoro ~6x lebih lambat dari Piper, jadi butuh timeout lebih longgar.
 _DEFAULT_TIMEOUT = "240" if TTS_PROVIDER == "kokoro" else "90"
 TTS_TIMEOUT = float(env("TTS_TIMEOUT", _DEFAULT_TIMEOUT))
-TTS_CONCURRENCY = max(1, int(env("TTS_CONCURRENCY", "4")))
+_conc_raw = env("TTS_CONCURRENCY")
+if _conc_raw:
+    TTS_CONCURRENCY = max(1, int(_conc_raw))
+else:
+    # Default sadar-provider, berdasarkan pengukuran di runner 2 vCPU
+    # (103 segmen, ~137 detik audio):
+    #   kokoro  concurrency=4 -> RTF ~2.75x   <- 3x LEBIH LAMBAT
+    #   kokoro  concurrency=2 -> RTF  0.96x
+    #   kokoro  concurrency=1 -> RTF  0.92x
+    #   piper   concurrency=4 -> RTF  0.165x
+    # onnxruntime sudah memakai semua core dalam satu sesi, jadi menjalankan
+    # 4 sesi Kokoro bersamaan di 2 vCPU = oversubscription dan thrashing.
+    # Piper jauh lebih ringan sehingga paralelisme tetap menguntungkan.
+    TTS_CONCURRENCY = 4 if TTS_PROVIDER == "piper" else 2
 TTS_TRIES = max(1, int(env("TTS_TRIES", env("PIPER_TRIES", "3"))))
 TTS_BACKOFF = float(env("TTS_BACKOFF", env("PIPER_BACKOFF", "2")))
 
