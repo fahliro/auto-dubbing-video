@@ -658,22 +658,41 @@ async def preflight_tts():
         probe.unlink(missing_ok=True)
 
 
+def tts_signature(text: str) -> str:
+    """Identitas lengkap sebuah hasil sintesis: provider + voice + parameter + teks.
+
+    WAJIB memuat provider dan voice. Kalau tag hanya berisi teks, mengganti
+    tts_provider atau voice akan diam-diam memakai ulang audio provider lama dari
+    cache -- video hasilnya bersuara provider yang salah tanpa peringatan apa pun,
+    dan pengujian provider baru akan "lulus" padahal tidak pernah dijalankan.
+
+    Perubahan format ini juga otomatis menginvalidasi cache lama (yang hanya
+    berisi teks), dan itu arah yang aman: regenerate, bukan pakai yang basi.
+    """
+    if TTS_PROVIDER == "kokoro":
+        cfg = f"kokoro|{KOKORO_VOICE}|{KOKORO_LANG}|{KOKORO_SPEED}"
+    else:
+        cfg = f"piper|{PIPER_VOICE}|{PIPER_LENGTH_SCALE or 'default'}"
+    return f"{cfg}|{text}"
+
+
 async def build_clip(i: int, seg: dict, sem: asyncio.Semaphore):
-    aud = WORK / f"tts_{i:04d}.audio"   # wav dari Piper; ffmpeg sniff isi file
+    aud = WORK / f"tts_{i:04d}.audio"   # wav dari Piper/Kokoro; ffmpeg sniff isi file
     wav = WORK / f"clip_{i:04d}.wav"
-    tag = WORK / f"tts_{i:04d}.txt"     # isi = teks yang dipakai -> invalidasi cache
+    tag = WORK / f"tts_{i:04d}.txt"     # isi = tts_signature() -> invalidasi cache
     slot = seg["slot"]
     text = seg["en"]
 
     def cached(t: str) -> bool:
         return (aud.exists() and aud.stat().st_size > 0
-                and tag.exists() and tag.read_text(encoding="utf-8") == t)
+                and tag.exists()
+                and tag.read_text(encoding="utf-8") == tts_signature(t))
 
     if cached(text):
         prov = "cache"
     else:
         prov = await tts(text, aud, sem)
-        tag.write_text(text, encoding="utf-8")
+        tag.write_text(tts_signature(text), encoding="utf-8")
     await asyncio.to_thread(to_wav, aud, wav)
     dur = wav_duration(wav)
     info = prov
@@ -686,7 +705,7 @@ async def build_clip(i: int, seg: dict, sem: asyncio.Semaphore):
             text = new_text
             if not cached(text):
                 prov = await tts(text, aud, sem)
-                tag.write_text(text, encoding="utf-8")
+                tag.write_text(tts_signature(text), encoding="utf-8")
             await asyncio.to_thread(to_wav, aud, wav)
             dur = wav_duration(wav)
             info = f"{prov}+shortened"
