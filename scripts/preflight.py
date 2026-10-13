@@ -6,9 +6,12 @@ Exit 1 = ada yang mati (workflow berhenti di sini, tidak ada waktu STT / kuota
          LLM yang terbuang).
 
 Yang diverifikasi:
-  1. TTS     -> voice/model ter-download, ter-load, dan sintesis menghasilkan audio
-  2. Whisper -> model ter-download, ter-load, dan bisa mentranskrip 1 detik audio
-                sunyi (menangkap OOM / nama model salah / library rusak)
+  1. TTS -> voice/model ter-download, ter-load, dan sintesis menghasilkan audio
+  2. STT -> sesuai STT_PROVIDER:
+      groq  : API key valid, model bisa diakses, kuota harian belum habis
+              (1 request uji dengan audio sunyi 1 detik)
+      local : model faster-whisper ter-download, ter-load, dan bisa mentranskrip
+              1 detik audio sunyi (menangkap OOM / nama model salah / lib rusak)
 
 Provider TTS mengikuti TTS_PROVIDER:
   piper   -> default. RTF ~0.23x di 2 vCPU, voice ~63 MB.
@@ -26,9 +29,12 @@ import time
 import wave
 from pathlib import Path
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 PROBE_TEXT = "Preflight check for the dubbing pipeline."
+GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
 # Body error dipotong sepanjang ini. Dulu 200 karakter, yang pernah membuat
 # URL "terms acceptance" dari sebuah API terpotong sehingga tidak bisa
@@ -119,7 +125,80 @@ def check_tts(provider: str) -> bool:
         out.unlink(missing_ok=True)
 
 
-# ----------------------------------------------------------------- Whisper
+# ------------------------------------------------------- STT: Groq Whisper
+def check_stt_groq(model: str) -> bool:
+    """Kirim 1 detik audio sunyi ke Groq Whisper.
+
+    Biaya: 1 request dari RPD 2000 dan 1 audio-second dari ASD 28800 -- cukup
+    murah untuk memvalidasi key, akses model, dan sisa kuota SEBELUM pipeline
+    menghabiskan waktu extract audio dan kuota LLM.
+    """
+    hr(f"GROQ WHISPER (cloud, model={model})")
+    key = env("GROQ_API_KEY")
+    if not key:
+        print("[groq-stt] GAGAL: secret GROQ_API_KEY kosong")
+        print("  - Isi di Settings > Secrets and variables > Actions, ATAU")
+        print("  - pakai stt_provider=local (faster-whisper di runner, tanpa key).")
+        print("::error::GROQ_API_KEY kosong padahal stt_provider=groq.")
+        return False
+
+    silent = Path("work/_preflight_silence.wav")
+    make_silence(silent, seconds=1.0)
+    try:
+        t0 = time.time()
+        with open(silent, "rb") as f:
+            r = requests.post(
+                GROQ_STT_URL,
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": (silent.name, f)},
+                data={"model": model, "language": "id",
+                      "response_format": "verbose_json", "temperature": "0",
+                      "timestamp_granularities[]": "segment"},
+                timeout=120)
+        dt = time.time() - t0
+        sisa_rpd = r.headers.get("x-ratelimit-remaining-requests", "?")
+        sisa_asd = r.headers.get("x-ratelimit-remaining-audio-seconds", "?")
+
+        if r.status_code == 200:
+            n = len(r.json().get("segments", []) or [])
+            print(f"[groq-stt] OK  {dt:.1f}s  ({n} segmen dari audio sunyi -- "
+                  "wajar 0/sedikit)")
+            print(f"[groq-stt] sisa kuota: RPD {sisa_rpd}, audio-seconds {sisa_asd}")
+            if sisa_rpd not in ("?", "") and str(sisa_rpd).isdigit() \
+                    and int(sisa_rpd) < 5:
+                print(f"[groq-stt] PERINGATAN: sisa kuota harian tinggal {sisa_rpd} "
+                      "request. Video panjang yang dipecah bisa kehabisan di tengah.")
+            return True
+
+        body = r.text[:ERR_BODY_LIMIT]
+        if "json" in r.headers.get("content-type", ""):
+            try:
+                body = str(r.json()["error"]["message"])[:ERR_BODY_LIMIT]
+            except Exception:  # noqa: BLE001
+                pass
+        print(f"[groq-stt] GAGAL: HTTP {r.status_code}: {body}")
+        if r.status_code in (401, 403):
+            print("  - GROQ_API_KEY tidak valid / sudah di-revoke / tidak punya")
+            print("    akses ke model ini.")
+        elif r.status_code == 429:
+            print("  - Kuota habis atau rate limit. Tunggu reset, atau pakai")
+            print("    stt_provider=local.")
+        elif r.status_code == 404:
+            print(f"  - Model '{model}' tidak dikenal Groq. Pilihan yang valid:")
+            print("    whisper-large-v3, whisper-large-v3-turbo.")
+        else:
+            print("  - Coba stt_provider=local untuk transkripsi di runner tanpa API.")
+        print(f"::error::Groq STT gagal (HTTP {r.status_code}).")
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"[groq-stt] GAGAL: {type(e).__name__}: {e}")
+        print("  - Cek koneksi runner ke api.groq.com.")
+        return False
+    finally:
+        silent.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------- STT: faster-whisper lokal
 def check_whisper(model: str) -> bool:
     hr(f"FASTER-WHISPER (lokal, model={model})")
     import dub
@@ -198,11 +277,17 @@ def report_versions(provider: str) -> bool:
     """
     hr("VERSI DEPENDENSI")
     ok = True
-    optional = {"kokoro_onnx"} if provider != "kokoro" else set()
+    stt_local = env("STT_PROVIDER", "groq").lower() == "local"
+    # kokoro_onnx hanya wajib kalau TTS provider-nya kokoro. faster_whisper, av,
+    # dan ctranslate2 hanya wajib kalau STT-nya lokal -- saat STT_PROVIDER=groq
+    # ketiganya tidak dipakai sama sekali, jadi tidak boleh membuat preflight gagal.
+    optional = set() if provider == "kokoro" else {"kokoro_onnx"}
+    if not stt_local:
+        optional |= {"faster_whisper", "av", "ctranslate2"}
     for mod, attr in (("faster_whisper", "__version__"), ("av", "__version__"),
                       ("ctranslate2", "__version__"), ("onnxruntime", "__version__"),
                       ("piper", None), ("kokoro_onnx", None),
-                      ("openai", "__version__")):
+                      ("requests", "__version__"), ("openai", "__version__")):
         try:
             m = __import__(mod)
             v = getattr(m, attr, "?") if attr else "terpasang"
@@ -214,8 +299,11 @@ def report_versions(provider: str) -> bool:
             print(f"  {mod:<16} GAGAL DIIMPOR: {type(e).__name__}: {e}")
             ok = False
 
-    # PyAV >= 19 tidak kompatibel dengan faster-whisper 1.2.1
+    # PyAV >= 19 tidak kompatibel dengan faster-whisper 1.2.1.
+    # Hanya relevan kalau STT lokal yang dipakai.
     try:
+        if not stt_local:
+            raise ImportError("dilewati: STT_PROVIDER bukan local")
         import av
         if int(str(av.__version__).split(".")[0]) >= 19:
             print(f"  !! PyAV {av.__version__} >= 19 TIDAK kompatibel dengan "
@@ -250,26 +338,39 @@ def main():
 
     voice = (env("TTS_KOKORO_VOICE", "af_bella") if provider == "kokoro"
              else env("TTS_PIPER_VOICE", "en_US-lessac-medium"))
-    model = env("STT_MODEL", "large-v3-turbo")
-    print(f"[preflight] TTS_PROVIDER={provider} voice={voice}  STT_MODEL={model}")
+    stt_provider = env("STT_PROVIDER", "groq").lower()
+    if stt_provider not in ("groq", "local"):
+        print(f"[preflight] STT_PROVIDER '{stt_provider}' tidak dikenal. "
+              "Pilihan: groq, local.")
+        print("::error::STT_PROVIDER tidak valid (harus groq atau local).")
+        return 1
+    model = (env("STT_GROQ_MODEL", "whisper-large-v3") if stt_provider == "groq"
+             else env("STT_MODEL", "large-v3-turbo"))
+    print(f"[preflight] TTS_PROVIDER={provider} voice={voice}")
+    print(f"[preflight] STT_PROVIDER={stt_provider} model={model}")
     print(f"[preflight] LLM_BASE_URL={'(diset)' if env('LLM_BASE_URL') else '(default OpenAI)'} "
           f"LLM_MODEL={env('LLM_MODEL', 'gpt-4o-mini')} "
           f"LLM_API_KEY={'ada' if env('LLM_API_KEY') else 'TIDAK ADA'}")
 
     ok_deps = report_versions(provider)
     ok_tts = check_tts(provider)
-    ok_whisper = check_whisper(model)
+    ok_stt = (check_stt_groq(model) if stt_provider == "groq"
+              else check_whisper(model))
 
     hr("RINGKASAN")
     print(f"  Dependensi     : {'OK' if ok_deps else 'TIDAK KOMPATIBEL'}")
     print(f"  {provider.capitalize()} TTS".ljust(17) + f": {'OK' if ok_tts else 'GAGAL'}")
-    print(f"  faster-whisper : {'OK' if ok_whisper else 'GAGAL'}")
+    stt_label = "Groq Whisper" if stt_provider == "groq" else "faster-whisper"
+    print(f"  {stt_label}".ljust(17) + f": {'OK' if ok_stt else 'GAGAL'}")
     print(f"  LLM_API_KEY    : {'ada' if env('LLM_API_KEY') else 'TIDAK ADA (wajib)'}")
+    if stt_provider == "groq":
+        print(f"  GROQ_API_KEY   : {'ada' if env('GROQ_API_KEY') else 'TIDAK ADA (wajib)'}")
 
-    if not (ok_deps and ok_tts and ok_whisper and env("LLM_API_KEY")):
+    if not (ok_deps and ok_tts and ok_stt and env("LLM_API_KEY")
+            and (env("GROQ_API_KEY") if stt_provider == "groq" else True)):
         print("::error::Preflight gagal. Lihat detail di atas.")
         return 1
-    print(f"::notice::Preflight OK: {provider} TTS + faster-whisper siap, semua lokal.")
+    print(f"::notice::Preflight OK: TTS {provider} (lokal) + STT {stt_label} siap.")
     return 0
 
 

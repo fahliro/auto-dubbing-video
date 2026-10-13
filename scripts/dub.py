@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
-"""Auto dubbing Indonesia -> English. Sepenuhnya lokal untuk STT & TTS.
+"""Auto dubbing Indonesia -> English.
 
 Pipeline:
-  video -> ffmpeg (extract audio 16k mono)
-        -> faster-whisper LOKAL (segments + timestamp, tanpa API)
-        -> LLM (translate, dubbing-friendly)   <- satu-satunya panggilan cloud
-        -> Piper TTS LOKAL (per segmen, tanpa API)
+  video -> ffmpeg (extract audio)
+        -> STT: Groq Whisper (cloud, default) ATAU faster-whisper (lokal)
+        -> LLM (translate, dubbing-friendly)
+        -> TTS: Piper (lokal, default) ATAU Kokoro-82M (lokal, opsi)
         -> ffmpeg (trim silence, shorten text / speed up if too long)
         -> assemble timeline -> mux ke video (extend video jika audio lebih panjang)
 
-Kenapa lokal semua:
-  - Edge TTS   : 403, Microsoft memblokir IP datacenter runner GitHub Actions.
-  - Groq TTS   : canopylabs/orpheus-v1-english tier gratis RPM=10, RPD=100.
-                 Video 92 segmen menghabiskan kuota harian dalam satu run.
-  - Groq STT   : whisper-large-v3 RPM=20, RPD=2000 + butuh upload audio.
-  Piper (onnxruntime) dan faster-whisper (CTranslate2) jalan di CPU runner:
-  tanpa API key, tanpa kuota, tanpa rate limit, tidak bisa diblokir per IP.
+STT_PROVIDER (env) -- dua opsi, pilih sesuai kebutuhan:
 
-Yang masih butuh jaringan hanya LLM penerjemah (LLM_API_KEY / LLM_BASE_URL)
-dan download model sekali (di-cache antar run).
+  groq  (DEFAULT) -> Groq Whisper API, model whisper-large-v3.
+                     Akurasi lebih baik: ini model large-v3 penuh, sedangkan
+                     default lokal memakai large-v3-TURBO yang memang memangkas
+                     akurasi demi kecepatan.
+                     Kuota tier gratis: RPM 20, RPD 2000, ASH 7200 (audio
+                     seconds/jam), ASD 28800. Video 325 detik = 1 request dan
+                     325 audio-seconds, jadi sangat longgar -- beda jauh dengan
+                     Groq TTS Orpheus yang cuma RPD 100.
+                     Butuh secret GROQ_API_KEY.
+
+  local           -> faster-whisper (CTranslate2) di CPU runner.
+                     Tanpa API key, tanpa kuota, tanpa upload audio.
+                     Lebih lambat (RTF ~0.84 untuk large-v3-turbo di 2 vCPU) dan
+                     akurasi tergantung model yang dipilih.
+
+TTS tetap lokal semua (Piper / Kokoro) karena kedua opsi cloud-nya buntu:
+  - Edge TTS : 403, Microsoft memblokir IP datacenter runner GitHub Actions.
+  - Groq TTS : canopylabs/orpheus-v1-english tier gratis RPM=10, RPD=100.
+               Video 92 segmen menghabiskan kuota harian dalam satu run.
 """
 import asyncio
 import hashlib
@@ -34,6 +45,7 @@ import urllib.request
 import wave
 from pathlib import Path
 
+import requests
 from openai import OpenAI
 
 # faster_whisper dan piper diimpor lazy di dalam fungsinya masing-masing:
@@ -70,7 +82,22 @@ CPS = float(env("CHARS_PER_SEC", "14"))  # estimasi karakter/detik TTS inggris
 SHORTEN_RATIO = 1.2  # jika audio > slot * 1.2 -> minta LLM mempersingkat dulu
 SR = 24000  # sample rate audio dubbing
 
-# --- STT: faster-whisper lokal ------------------------------------------
+# --- STT: groq (default) | local ----------------------------------------
+STT_PROVIDER = env("STT_PROVIDER", "groq").lower()
+if STT_PROVIDER not in ("groq", "local"):
+    raise SystemExit(
+        f"STT_PROVIDER '{STT_PROVIDER}' tidak dikenal. Pilihan: groq, local.")
+
+GROQ_KEY = env("GROQ_API_KEY")
+GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+# Model Groq: whisper-large-v3 (akurasi penuh) atau whisper-large-v3-turbo.
+STT_GROQ_MODEL = env("STT_GROQ_MODEL", "whisper-large-v3")
+# Batas unggah Groq 24 MB -> audio dipecah per 20 menit kalau melebihi.
+GROQ_MAX_BYTES = 24 * 1024 * 1024
+GROQ_CHUNK_SECONDS = int(env("STT_CHUNK_SECONDS", "1200"))
+
+# Model faster-whisper lokal. Default turbo: cepat, tapi akurasinya DI BAWAH
+# large-v3 penuh -- itu alasan STT_PROVIDER default-nya groq.
 STT_MODEL = env("STT_MODEL", "large-v3-turbo")
 STT_DEVICE = env("STT_DEVICE", "cpu")
 STT_COMPUTE_TYPE = env("STT_COMPUTE_TYPE", "int8")
@@ -82,6 +109,11 @@ STT_LANGUAGE = env("STT_LANGUAGE", "id")                 # kosong = auto-detect
 # lebih cepat. Nyalakan kalau video punya banyak hening dan muncul halusinasi.
 STT_VAD = env_bool("STT_VAD_FILTER", False)
 STT_MODEL_DIR = Path(env("STT_MODEL_DIR", ".whisper-models"))
+
+# Identitas STT yang benar-benar berjalan. Dipakai untuk signature cache:
+# hasil transkrip groq whisper-large-v3 dan local large-v3-turbo BERBEDA, jadi
+# tidak boleh saling menggantikan di cache.
+STT_EFFECTIVE = f"{STT_PROVIDER}:{STT_GROQ_MODEL if STT_PROVIDER == 'groq' else STT_MODEL}"
 
 # --- TTS lokal: piper (default) | kokoro --------------------------------
 # Keduanya jalan di CPU runner, tanpa API key / kuota / rate limit.
@@ -200,19 +232,52 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
 
 
 # ----------------------------------------------------------------- 1. STT (lokal)
-def extract_audio() -> Path:
-    """Video -> WAV 16 kHz mono.
+def extract_audio_local() -> Path:
+    """Video -> WAV 16 kHz mono, satu file utuh (untuk faster-whisper).
 
-    faster-whisper membaca audio lewat PyAV, tapi kita seragamkan ke 16 kHz mono
-    lebih dulu supaya deterministik dan sama persis dengan yang dulu dikirim ke
-    Groq. Tidak ada lagi pemecahan per 20 menit: itu cuma karena Groq membatasi
-    ukuran file 24 MB, dan Whisper lokal tidak punya batas semacam itu (memori
-    terikat pada jendela 30 detik, bukan panjang file).
+    Whisper lokal tidak punya batas ukuran file: memorinya terikat pada jendela
+    30 detik, bukan panjang audio. Jadi tidak perlu dipecah.
     """
     out = WORK / "audio.wav"
     run(["ffmpeg", "-y", "-i", VIDEO, "-vn", "-ac", "1", "-ar", "16000",
          "-c:a", "pcm_s16le", out])
     return out
+
+
+def extract_audio_groq():
+    """Video -> MP3 48k mono, dipecah per 20 menit bila > 24 MB.
+
+    Return list[(path, offset_detik)]. Pemecahan ini hanya perlu untuk Groq yang
+    membatasi ukuran unggahan 24 MB; offset dipakai agar timestamp antar-chunk
+    tetap nyambung jadi satu timeline.
+    """
+    full = WORK / "audio.mp3"
+    run(["ffmpeg", "-y", "-i", VIDEO, "-vn", "-ac", "1", "-ar", "16000",
+         "-c:a", "libmp3lame", "-b:a", "48k", full])
+    if full.stat().st_size <= GROQ_MAX_BYTES:
+        return [(full, 0.0)]
+
+    print(f"[stt] audio {full.stat().st_size / 1e6:.1f} MB > "
+          f"{GROQ_MAX_BYTES / 1e6:.0f} MB (batas Groq) "
+          f"-> dipecah per {GROQ_CHUNK_SECONDS}s")
+    run(["ffmpeg", "-y", "-i", full, "-f", "segment",
+         "-segment_time", str(GROQ_CHUNK_SECONDS),
+         "-reset_timestamps", "1", "-c:a", "libmp3lame", "-b:a", "48k",
+         WORK / "chunk_%03d.mp3"])
+    chunks, offset, res = sorted(WORK.glob("chunk_*.mp3")), 0.0, []
+    for c in chunks:
+        # Kalau durasi audio kelipatan persis segment_time, ffmpeg bisa
+        # meninggalkan chunk terakhir berisi header saja (~200-500 byte, durasi 0).
+        # Mengirimnya ke Groq cuma menghabiskan 1 request kuota dan berisiko
+        # menyisipkan segmen kosong di ujung timeline.
+        if c.stat().st_size <= 1024:
+            print(f"[stt] lewati {c.name} ({c.stat().st_size} byte, chunk kosong)")
+            continue
+        res.append((c, offset))
+        offset += probe_duration(c)
+    if not res:
+        sys.exit("[stt] tidak ada chunk audio yang valid untuk dikirim ke Groq")
+    return res
 
 
 def load_stt_model():
@@ -246,6 +311,81 @@ def load_stt_model():
     return _STT
 
 
+def groq_transcribe(path: Path) -> dict:
+    """POST audio ke Groq Whisper. Retry untuk 429/5xx, hormati retry-after."""
+    if not GROQ_KEY:
+        sys.exit("[stt] STT_PROVIDER=groq tapi secret GROQ_API_KEY kosong.\n"
+                 "  Isi secret-nya, atau set STT_PROVIDER=local / input "
+                 "stt_provider=local untuk pakai faster-whisper di runner.")
+    r = None
+    for attempt in range(5):
+        with open(path, "rb") as f:
+            r = requests.post(
+                GROQ_STT_URL,
+                headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                files={"file": (path.name, f)},
+                data={
+                    "model": STT_GROQ_MODEL,
+                    "language": STT_LANGUAGE or "id",
+                    "response_format": "verbose_json",
+                    "temperature": "0",
+                    "timestamp_granularities[]": "segment",
+                },
+                timeout=600,
+            )
+        if r.status_code == 429 or r.status_code >= 500:
+            # retry-after dari server lebih akurat daripada backoff tebak-tebakan
+            try:
+                wait = min(max(float(r.headers.get("retry-after", "")), 1.0), 120.0)
+            except (TypeError, ValueError):
+                wait = 5 * (2 ** attempt)
+            sisa = r.headers.get("x-ratelimit-remaining-requests", "?")
+            print(f"[groq] {r.status_code}, retry dalam {wait:.0f}s "
+                  f"(sisa kuota harian: {sisa})")
+            if sisa == "0":
+                sys.exit(f"[groq] Kuota harian (RPD) habis untuk {STT_GROQ_MODEL}.\n"
+                         "  Tunggu reset, atau pakai stt_provider=local.")
+            time.sleep(wait)
+            continue
+        if r.status_code in (401, 403):
+            sys.exit(f"[groq] {r.status_code}: {r.text[:400]}\n"
+                     "  Secret GROQ_API_KEY tidak valid / tidak punya akses model ini.")
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
+
+
+def transcribe_groq():
+    """STT lewat Groq Whisper API."""
+    video_dur = probe_duration(VIDEO)
+    parts = extract_audio_groq()
+    print(f"[stt] groq model={STT_GROQ_MODEL}, {len(parts)} berkas audio, "
+          f"video {video_dur:.1f}s")
+    segs = []
+    t0 = time.time()
+    for path, offset in parts:
+        print(f"[stt] {path.name} ({path.stat().st_size / 1e6:.1f} MB, "
+              f"offset {offset:.1f}s)")
+        data = groq_transcribe(path)
+        n = 0
+        for s in data.get("segments", []):
+            text = s["text"].strip()
+            if text:
+                segs.append({"start": s["start"] + offset,
+                             "end": s["end"] + offset,
+                             "src": text})
+                n += 1
+        print(f"[stt]   -> {n} segmen")
+    el = time.time() - t0
+    segs.sort(key=lambda x: x["start"])
+    print(f"[stt] selesai {el:.1f}s (RTF {el / max(video_dur, 0.1):.3f}x) | "
+          f"groq {STT_GROQ_MODEL} | {len(segs)} segmen mentah")
+    merged = merge_short(segs)
+    if len(merged) != len(segs):
+        print(f"[stt] merge_short: {len(segs)} -> {len(merged)} segmen")
+    return merged
+
+
 def merge_short(segs, min_dur=1.0, max_gap=0.4, max_len=12.0):
     """Gabung segmen yang terlalu pendek supaya TTS lebih natural."""
     out = []
@@ -263,10 +403,20 @@ def merge_short(segs, min_dur=1.0, max_gap=0.4, max_len=12.0):
 
 
 def transcribe():
-    """Transkripsi lokal. `segments` adalah generator: waktu diukur mengelilingi
-    iterasinya, bukan pemanggilan transcribe()."""
+    """Pilih jalur STT sesuai STT_PROVIDER."""
+    if STT_PROVIDER == "groq":
+        return transcribe_groq()
+    return transcribe_local()
+
+
+def transcribe_local():
+    """Transkripsi lokal dengan faster-whisper.
+
+    `segments` adalah generator: waktu diukur mengelilingi iterasinya, bukan
+    pemanggilan transcribe().
+    """
     model = load_stt_model()
-    audio = extract_audio()
+    audio = extract_audio_local()
     video_dur = probe_duration(VIDEO)
     print(f"[stt] {audio.name} ({audio.stat().st_size / 1e6:.1f} MB, "
           f"video {video_dur:.1f}s)")
@@ -890,8 +1040,9 @@ def load_state(video_sha: str):
     alasan = []
     if st.get("video_sha") != video_sha:
         alasan.append(f"video_sha {str(st.get('video_sha'))[:12]}.. != {video_sha[:12]}..")
-    if st.get("stt_model") != STT_MODEL:
-        alasan.append(f"stt_model {st.get('stt_model')!r} != {STT_MODEL!r}")
+    if st.get("stt_effective") != STT_EFFECTIVE:
+        alasan.append(f"stt {st.get('stt_effective') or st.get('stt_model')!r} "
+                      f"!= {STT_EFFECTIVE!r}")
     if st.get("llm_model") != LLM_MODEL:
         alasan.append(f"llm_model {st.get('llm_model')!r} != {LLM_MODEL!r}")
     seg = st.get("segments")
@@ -910,6 +1061,12 @@ def load_state(video_sha: str):
 def save_state(video_sha: str, segs):
     STATE.write_text(json.dumps({
         "video_sha": video_sha,
+        # stt_effective = "<provider>:<model>". WAJIB memuat provider: transkrip
+        # groq whisper-large-v3 dan local large-v3-turbo berbeda, jadi saling
+        # menggantikan dari cache akan menghasilkan dubbing yang salah diam-diam.
+        # (Kelas bug yang sama dengan tag cache TTS yang dulu hanya berisi teks.)
+        "stt_effective": STT_EFFECTIVE,
+        "stt_provider": STT_PROVIDER,
         "stt_model": STT_MODEL,
         "llm_model": LLM_MODEL,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -924,6 +1081,9 @@ def main():
         sys.exit(f"Video tidak ditemukan: {VIDEO}")
     if not LLM_KEY:
         sys.exit("LLM_API_KEY belum di-set")
+    if STT_PROVIDER == "groq" and not GROQ_KEY:
+        sys.exit("STT_PROVIDER=groq tapi GROQ_API_KEY belum di-set.\n"
+                 "  Isi secret GROQ_API_KEY, atau pakai stt_provider=local.")
     llm = OpenAI(api_key=LLM_KEY, base_url=LLM_BASE or None)
 
     WORK.mkdir(exist_ok=True)
@@ -931,8 +1091,13 @@ def main():
 
     video_dur = probe_duration(VIDEO)
     print(f"[init] video {video_dur:.1f}s, max_speedup={MAX_SPEEDUP}")
-    print(f"[init] STT lokal: model={STT_MODEL} device={STT_DEVICE} "
-          f"compute={STT_COMPUTE_TYPE} vad={STT_VAD} lang={STT_LANGUAGE or 'auto'}")
+    if STT_PROVIDER == "groq":
+        print(f"[init] STT cloud: provider=groq model={STT_GROQ_MODEL} "
+              f"lang={STT_LANGUAGE or 'id'}")
+    else:
+        print(f"[init] STT lokal: model={STT_MODEL} device={STT_DEVICE} "
+              f"compute={STT_COMPUTE_TYPE} vad={STT_VAD} "
+              f"lang={STT_LANGUAGE or 'auto'}")
     if TTS_PROVIDER == "kokoro":
         print(f"[init] TTS lokal: provider=kokoro voice={KOKORO_VOICE} "
               f"lang={KOKORO_LANG} speed={KOKORO_SPEED} concurrency={TTS_CONCURRENCY}")
