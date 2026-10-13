@@ -200,11 +200,22 @@ jobs:
           else
             K="path-$(sha256sum "$VIDEO_PATH" | cut -c1-32)"
           fi
-          # run_attempt ikut di key agar tiap percobaan menyimpan progres barunya
-          # sendiri; restore-keys mengambil progres attempt sebelumnya.
-          echo "key=dub-work-${K}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          # run_id + run_attempt ikut di key supaya SETIAP run menulis entri baru.
+          #
+          # Sebelumnya key hanya memakai run_attempt, yang bernilai 1 untuk semua
+          # run baru (hanya naik saat re-run). Akibatnya run kedua dst. gagal
+          # menyimpan cache:
+          #   "Failed to save: Unable to reserve cache with key ..., another job
+          #    may be creating this cache."
+          # dan karena step-nya pakai continue-on-error, kegagalan itu SENYAP --
+          # cache membeku di isi run pertama selamanya.
+          #
+          # restore-keys berbasis prefix membuat restore mengambil entri paling
+          # baru yang cocok, jadi progres terbaru selalu yang dipakai.
+          echo "key=dub-work-${K}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
           echo "restore=dub-work-${K}-" >> "$GITHUB_OUTPUT"
-          echo "cache key: dub-work-${K}-${{ github.run_attempt }}"
+          echo "cache key : dub-work-${K}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "restore   : dub-work-${K}- (prefix, ambil yang terbaru)"
 
       # Cache hasil STT + translate + audio TTS per segmen.
       # Efeknya: kalau run gagal di tahap akhir, re-run tidak mengulang
@@ -234,6 +245,7 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ inputs.llm_model }}
+          PYTHONUNBUFFERED: "1"
         run: python scripts/preflight.py
 
       - name: Jalankan auto dubbing
@@ -255,6 +267,10 @@ jobs:
           KEEP_ORIGINAL_VOLUME: ${{ inputs.keep_original_volume }}
           BURN_SUBTITLES: ${{ inputs.burn_subtitles }}
           SUBTITLE_FONT_SIZE: ${{ inputs.subtitle_font_size }}
+          # WAJIB: tanpa ini stdout Python ter-buffer (bukan TTY), sehingga
+          # seluruh log baru muncul di akhir step dan HILANG TOTAL kalau proses
+          # mati keras (segfault onnxruntime / OOM-kill). Pernah terjadi.
+          PYTHONUNBUFFERED: "1"
         run: python scripts/dub.py
 
       # PENTING: simpan cache walau job GAGAL. Tanpa ini, puluhan segmen yang

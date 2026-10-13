@@ -874,13 +874,23 @@ def load_state(video_sha: str):
     except Exception as e:  # noqa: BLE001
         print(f"[cache] state.json tidak bisa dibaca, hitung ulang ({e})")
         return None
-    if (st.get("video_sha") == video_sha
-            and st.get("stt_model") == STT_MODEL
-            and st.get("llm_model") == LLM_MODEL
-            and isinstance(st.get("segments"), list) and st["segments"]
-            and all(s.get("en") for s in st["segments"])):
-        return st["segments"]
-    print("[cache] state.json tidak cocok (video/model beda) -> hitung ulang")
+    alasan = []
+    if st.get("video_sha") != video_sha:
+        alasan.append(f"video_sha {str(st.get('video_sha'))[:12]}.. != {video_sha[:12]}..")
+    if st.get("stt_model") != STT_MODEL:
+        alasan.append(f"stt_model {st.get('stt_model')!r} != {STT_MODEL!r}")
+    if st.get("llm_model") != LLM_MODEL:
+        alasan.append(f"llm_model {st.get('llm_model')!r} != {LLM_MODEL!r}")
+    seg = st.get("segments")
+    if not isinstance(seg, list) or not seg:
+        alasan.append("segments kosong/bukan list")
+    else:
+        kosong = sum(1 for s in seg if not s.get("en"))
+        if kosong:
+            alasan.append(f"{kosong} segmen tanpa terjemahan 'en'")
+    if not alasan:
+        return seg
+    print(f"[cache] state.json DITOLAK -> hitung ulang. Alasan: {'; '.join(alasan)}")
     return None
 
 
@@ -925,9 +935,19 @@ def main():
     print(f"[init] sha256 video {video_sha[:16]}...")
 
     t_start = time.time()
+    timing = {}          # nama fase -> detik, dicetak sebagai ringkasan di akhir
+    _mark = [t_start]
+
+    def lap(name):
+        """Catat durasi fase sejak `lap` terakhir."""
+        now = time.time()
+        timing[name] = now - _mark[0]
+        _mark[0] = now
+        print(f"[waktu] {name:<22} {timing[name]:7.1f}s ({timing[name] / 60:.1f} mnt)")
 
     # 0) Cek TTS dulu: murah (~2 detik), hemat waktu STT & kuota LLM kalau mati.
     asyncio.run(preflight_tts())
+    lap("preflight TTS")
 
     # 1-2) STT lokal + translate (di-cache antar run untuk video yang sama)
     segs = load_state(video_sha)
@@ -935,17 +955,21 @@ def main():
         print(f"[cache] pakai ulang hasil STT+translate: {len(segs)} segmen "
               "(skip faster-whisper & LLM)")
         compute_slots(segs, video_dur)
+        lap("STT+LLM (dari cache)")
     else:
         segs = transcribe()
         if not segs:
             sys.exit("Tidak ada ucapan terdeteksi")
         print(f"[stt] {len(segs)} segmen")
+        lap("STT lokal")
         compute_slots(segs, video_dur)
         translate(segs)
+        lap("LLM translate")
         save_state(video_sha, segs)
 
     # 3) TTS lokal
     clips = asyncio.run(build_all(segs))
+    lap(f"TTS {TTS_PROVIDER}")
 
     # 4) assemble + mux
     dub_wav, dub_dur, placed = assemble(segs, clips, video_dur)
@@ -956,7 +980,21 @@ def main():
     save_state(video_sha, segs)  # teks final (mungkin sudah di-shorten)
     (OUT / "segments.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
+    lap("assemble+mux+srt")
     total = time.time() - t_start
+
+    # Ringkasan waktu per fase. Penting untuk membandingkan provider: tanpa ini
+    # hanya total yang terlihat, padahal STT dan TTS bisa bertukar porsi.
+    audio_dur = sum(c[1] for c in clips) if clips else 0.0
+    print("\n[ringkasan waktu]")
+    for name, sec in timing.items():
+        print(f"  {name:<22} {sec:7.1f}s  {100 * sec / total:5.1f}%")
+    print(f"  {'TOTAL':<22} {total:7.1f}s  ({total / 60:.1f} menit)")
+    t_tts = timing.get(f"TTS {TTS_PROVIDER}", 0.0)
+    if t_tts and audio_dur:
+        print(f"  RTF TTS terukur        {t_tts / audio_dur:7.3f}x "
+              f"({t_tts:.0f}s proses / {audio_dur:.0f}s audio, "
+              f"{len(segs)} segmen)")
     print(f"[done] output/dubbed.mp4, dubbed.en.srt, dub.wav, segments.json "
           f"| {len(segs)} segmen | total {total:.0f}s ({total / 60:.1f} menit)")
 
