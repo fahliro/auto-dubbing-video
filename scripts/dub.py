@@ -2,17 +2,34 @@
 """Auto dubbing Indonesia -> English.
 
 Pipeline:
-  video -> ffmpeg (extract audio) -> Groq Whisper (segments + timestamp)
-        -> LLM (translate, dubbing-friendly) -> TTS (per segment)
+  video -> ffmpeg (extract audio)
+        -> STT: Groq Whisper (cloud, default) ATAU faster-whisper (lokal)
+        -> LLM (translate, dubbing-friendly)
+        -> TTS: Piper (lokal, default) ATAU Kokoro-82M (lokal, opsi)
         -> ffmpeg (trim silence, shorten text / speed up if too long)
-        -> assemble timeline -> mux ke video (extend video jika audio masih lebih panjang)
+        -> assemble timeline -> mux ke video (extend video jika audio lebih panjang)
 
-TTS provider (env TTS_PROVIDER):
-  groq  -> Groq Orpheus. Default: andal dari GitHub Actions karena Microsoft
-           memblokir IP datacenter runner dengan 403. Butuh GROQ_API_KEY.
-  auto  -> coba Edge TTS dulu; kalau kena 403, otomatis pindah ke Groq Orpheus
-           untuk SEMUA segmen sisanya.
-  edge  -> paksa Edge TTS saja (gagal keras kalau IP runner diblokir)
+STT_PROVIDER (env) -- dua opsi, pilih sesuai kebutuhan:
+
+  groq  (DEFAULT) -> Groq Whisper API, model whisper-large-v3.
+                     Akurasi lebih baik: ini model large-v3 penuh, sedangkan
+                     default lokal memakai large-v3-TURBO yang memang memangkas
+                     akurasi demi kecepatan.
+                     Kuota tier gratis: RPM 20, RPD 2000, ASH 7200 (audio
+                     seconds/jam), ASD 28800. Video 325 detik = 1 request dan
+                     325 audio-seconds, jadi sangat longgar -- beda jauh dengan
+                     Groq TTS Orpheus yang cuma RPD 100.
+                     Butuh secret GROQ_API_KEY.
+
+  local           -> faster-whisper (CTranslate2) di CPU runner.
+                     Tanpa API key, tanpa kuota, tanpa upload audio.
+                     Lebih lambat (RTF ~0.84 untuk large-v3-turbo di 2 vCPU) dan
+                     akurasi tergantung model yang dipilih.
+
+TTS tetap lokal semua (Piper / Kokoro) karena kedua opsi cloud-nya buntu:
+  - Edge TTS : 403, Microsoft memblokir IP datacenter runner GitHub Actions.
+  - Groq TTS : canopylabs/orpheus-v1-english tier gratis RPM=10, RPD=100.
+               Video 92 segmen menghabiskan kuota harian dalam satu run.
 """
 import asyncio
 import hashlib
@@ -31,8 +48,9 @@ from pathlib import Path
 import requests
 from openai import OpenAI
 
-# edge_tts diimpor lazy di dalam _edge_once(): kalau TTS_PROVIDER=groq, run tidak
-# boleh gagal hanya karena paket edge-tts bermasalah.
+# faster_whisper dan piper diimpor lazy di dalam fungsinya masing-masing:
+# ctranslate2 & onnxruntime berat (ratusan MB), dan tidak perlu dimuat hanya
+# untuk membaca config atau menjalankan bagian lain dari script.
 
 
 # ----------------------------------------------------------------- config
@@ -41,47 +59,69 @@ def env(name: str, default: str = "") -> str:
     return v or default
 
 
+def env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "y", "on")
+
+
 VIDEO = Path(env("VIDEO_FILE"))
 WORK = Path("work")
 OUT = Path("output")
-
-GROQ_KEY = env("GROQ_API_KEY")
-STT_MODEL = env("STT_MODEL", "whisper-large-v3")
 
 LLM_KEY = env("LLM_API_KEY")
 LLM_BASE = env("LLM_BASE_URL")  # kosong = default OpenAI
 LLM_MODEL = env("LLM_MODEL", "gpt-4o-mini")
 
-VOICE = env("TTS_VOICE", "en-US-AndrewNeural")
-RATE = env("TTS_RATE", "+0%")  # rate dasar Edge TTS, mis. "+5%"
 MAX_SPEEDUP = max(1.0, min(float(env("MAX_SPEEDUP", "1.5")), 2.0))
 KEEP_ORIG = float(env("KEEP_ORIGINAL_VOLUME", "0"))
-BURN_SUBS = env("BURN_SUBTITLES", "true").lower() in ("1", "true", "yes")
+BURN_SUBS = env_bool("BURN_SUBTITLES", True)
 SUB_FONT_SIZE = env("SUBTITLE_FONT_SIZE")  # kosong = otomatis (landscape 16, portrait 12)
 CPS = float(env("CHARS_PER_SEC", "14"))  # estimasi karakter/detik TTS inggris
 SHORTEN_RATIO = 1.2  # jika audio > slot * 1.2 -> minta LLM mempersingkat dulu
 SR = 24000  # sample rate audio dubbing
 
-# --- TTS provider -------------------------------------------------------
-TTS_PROVIDER = env("TTS_PROVIDER", "piper").lower()    # piper | groq | auto | edge
-TTS_TIMEOUT = float(env("TTS_TIMEOUT", "90"))           # detik, per percobaan
-TTS_CONCURRENCY = max(1, int(env("TTS_CONCURRENCY", "4")))
-EDGE_TRIES = max(1, int(env("EDGE_TRIES", "3")))        # 403 = permanen, jangan 5x
-GROQ_TRIES = max(1, int(env("GROQ_TRIES", "4")))
-PIPER_TRIES = max(1, int(env("PIPER_TRIES", "2")))     # lokal, jarang gagal
+# --- STT: groq (default) | local ----------------------------------------
+STT_PROVIDER = env("STT_PROVIDER", "groq").lower()
+if STT_PROVIDER not in ("groq", "local"):
+    raise SystemExit(
+        f"STT_PROVIDER '{STT_PROVIDER}' tidak dikenal. Pilihan: groq, local.")
 
-GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
-GROQ_TTS_MODEL = env("TTS_GROQ_MODEL", "canopylabs/orpheus-v1-english")
-GROQ_TTS_VOICE = env("TTS_GROQ_VOICE", "troy")
-# Orpheus: input maks 200 karakter. Pakai 190 supaya aman dari selisih hitung.
-GROQ_CHAR_LIMIT = max(50, int(env("TTS_GROQ_CHAR_LIMIT", "190")))
-# canopylabs/orpheus-v1-english di tier gratis: RPM=10, RPD=100
-# (https://console.groq.com/docs/rate-limits). Default 9 agar tidak menyentuh
-# plafon. RPD=100 artinya SATU video 92 segmen sudah menghabiskan kuota harian,
-# karena itu Piper (lokal) dijadikan default.
-GROQ_RPM = max(1, int(env("TTS_GROQ_RPM", "9")))
+GROQ_KEY = env("GROQ_API_KEY")
+GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+# Model Groq: whisper-large-v3 (akurasi penuh) atau whisper-large-v3-turbo.
+STT_GROQ_MODEL = env("STT_GROQ_MODEL", "whisper-large-v3")
+# Batas unggah Groq 24 MB -> audio dipecah per 20 menit kalau melebihi.
+GROQ_MAX_BYTES = 24 * 1024 * 1024
+GROQ_CHUNK_SECONDS = int(env("STT_CHUNK_SECONDS", "1200"))
 
-# --- Piper TTS: lokal, offline, tanpa API key & tanpa rate limit ---------
+# Model faster-whisper lokal. Default turbo: cepat, tapi akurasinya DI BAWAH
+# large-v3 penuh -- itu alasan STT_PROVIDER default-nya groq.
+STT_MODEL = env("STT_MODEL", "large-v3-turbo")
+STT_DEVICE = env("STT_DEVICE", "cpu")
+STT_COMPUTE_TYPE = env("STT_COMPUTE_TYPE", "int8")
+STT_THREADS = max(0, int(env("STT_THREADS", "0")))       # 0 = auto (semua core)
+STT_BEAM_SIZE = max(1, int(env("STT_BEAM_SIZE", "5")))
+STT_LANGUAGE = env("STT_LANGUAGE", "id")                 # kosong = auto-detect
+# vad_filter=False memberi segmen lebih pendek (median 5.0s, max 11.2s vs 6.2s/13.7s
+# pada clip uji 90 detik) sehingga lebih mudah pas di slot dubbing, dan sedikit
+# lebih cepat. Nyalakan kalau video punya banyak hening dan muncul halusinasi.
+STT_VAD = env_bool("STT_VAD_FILTER", False)
+STT_MODEL_DIR = Path(env("STT_MODEL_DIR", ".whisper-models"))
+
+# Identitas STT yang benar-benar berjalan. Dipakai untuk signature cache:
+# hasil transkrip groq whisper-large-v3 dan local large-v3-turbo BERBEDA, jadi
+# tidak boleh saling menggantikan di cache.
+STT_EFFECTIVE = f"{STT_PROVIDER}:{STT_GROQ_MODEL if STT_PROVIDER == 'groq' else STT_MODEL}"
+
+# --- TTS lokal: piper (default) | kokoro --------------------------------
+# Keduanya jalan di CPU runner, tanpa API key / kuota / rate limit.
+#   piper  : RTF ~0.23x di 2 vCPU. Cepat, ringan (63 MB voice).
+#   kokoro : RTF ~1.37x di 2 vCPU (~6x lebih lambat), tapi prosodinya lebih
+#            natural. 82M parameter, model int8 92 MB + voices 28 MB.
+TTS_PROVIDER = env("TTS_PROVIDER", "piper").lower()
+
 PIPER_VOICE = env("TTS_PIPER_VOICE", "en_US-lessac-medium")
 PIPER_DIR = Path(env("TTS_PIPER_DIR", ".piper-voices"))
 PIPER_HF_BASE = env("TTS_PIPER_HF_BASE",
@@ -89,31 +129,65 @@ PIPER_HF_BASE = env("TTS_PIPER_HF_BASE",
 # length_scale > 1 = lebih lambat, < 1 = lebih cepat. Kosong = default model.
 PIPER_LENGTH_SCALE = env("TTS_PIPER_LENGTH_SCALE")
 
-# Di-set True begitu Edge TTS balas 403 -> sisa segmen pindah provider lain.
-_EDGE_BLOCKED = False
-_GROQ_DAILY_EXHAUSTED = False   # RPD habis: retry tidak ada gunanya
-_ACTIVE_PROVIDER = "?"
-_PIPER_VOICE = None             # model Piper di-load sekali per proses
-_PIPER_LOCK = threading.Lock()
+# --- Kokoro-82M (opsi) ---------------------------------------------------
+KOKORO_VOICE = env("TTS_KOKORO_VOICE", "af_bella")
+KOKORO_DIR = Path(env("TTS_KOKORO_DIR", ".kokoro-models"))
+KOKORO_LANG = env("TTS_KOKORO_LANG", "en-us")
+KOKORO_SPEED = float(env("TTS_KOKORO_SPEED", "1.0"))
+KOKORO_MODEL_FILE = env("TTS_KOKORO_MODEL_FILE", "kokoro-v1.0.int8.onnx")
+KOKORO_VOICES_FILE = env("TTS_KOKORO_VOICES_FILE", "voices-v1.0.bin")
+KOKORO_BASE_URL = env(
+    "TTS_KOKORO_BASE_URL",
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0")
+# Kokoro mengalokasikan memori seiring panjang input (terukur: satu buffer conv
+# 157 MB untuk teks ~1000 karakter). Teks di atas batas ini dipecah per kalimat
+# lalu audio-nya disambung lagi di level array, bukan lewat ffmpeg.
+KOKORO_MAX_CHARS = max(100, int(env("TTS_KOKORO_MAX_CHARS", "500")))
 
-llm = None  # di-init di main()
+# Kokoro ~6x lebih lambat dari Piper, jadi butuh timeout lebih longgar.
+_DEFAULT_TIMEOUT = "240" if TTS_PROVIDER == "kokoro" else "90"
+TTS_TIMEOUT = float(env("TTS_TIMEOUT", _DEFAULT_TIMEOUT))
+_conc_raw = env("TTS_CONCURRENCY")
+if _conc_raw:
+    TTS_CONCURRENCY = max(1, int(_conc_raw))
+else:
+    # Default sadar-provider, berdasarkan pengukuran di runner 2 vCPU
+    # (103 segmen, ~137 detik audio):
+    #   kokoro  concurrency=4 -> RTF ~2.75x   <- 3x LEBIH LAMBAT
+    #   kokoro  concurrency=2 -> RTF  0.96x
+    #   kokoro  concurrency=1 -> RTF  0.92x
+    #   piper   concurrency=4 -> RTF  0.165x
+    # onnxruntime sudah memakai semua core dalam satu sesi, jadi menjalankan
+    # 4 sesi Kokoro bersamaan di 2 vCPU = oversubscription dan thrashing.
+    # Piper jauh lebih ringan sehingga paralelisme tetap menguntungkan.
+    TTS_CONCURRENCY = 4 if TTS_PROVIDER == "piper" else 2
+TTS_TRIES = max(1, int(env("TTS_TRIES", env("PIPER_TRIES", "3"))))
+TTS_BACKOFF = float(env("TTS_BACKOFF", env("PIPER_BACKOFF", "2")))
+
+llm = None            # di-init di main()
+_STT = None           # model faster-whisper, di-load sekali
+_STT_LOCK = threading.Lock()
+_PIPER_VOICE = None   # model Piper, di-load sekali
+_PIPER_LOCK = threading.Lock()
+_KOKORO = None        # instance kokoro_onnx.Kokoro, di-load sekali
+_KOKORO_LOCK = threading.Lock()
 
 
 # ----------------------------------------------------------------- utils
+class FFmpegError(RuntimeError):
+    """Kegagalan ffmpeg yang dilempar sebagai exception biasa.
+
+    Wajib dipakai di kode yang jalan dalam thread/async (to_wav): `sys.exit()`
+    di dalam thread hanya melempar SystemExit yang tidak tertangkap
+    `except Exception`, sehingga menembus logika retry.
+    """
+
+
 def run(cmd):
     p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
     if p.returncode != 0:
         sys.exit(f"Command gagal: {' '.join(map(str, cmd))}\n{p.stderr[-2000:]}")
     return p.stdout
-
-
-class FFmpegError(RuntimeError):
-    """Kegagalan ffmpeg yang dilempar sebagai exception biasa.
-
-    Wajib dipakai di kode yang jalan dalam thread/async (to_wav, _concat_wav).
-    `sys.exit()` di dalam thread hanya melempar SystemExit yang tidak bisa
-    ditangkap `except Exception`, sehingga lolos dari logika retry/fallback TTS.
-    """
 
 
 def run_cmd(cmd):
@@ -157,37 +231,102 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-# ----------------------------------------------------------------- 1. STT
-def extract_audio():
-    """Return list[(path, offset_detik)]. Dipecah per 20 menit jika > 24MB (limit Groq)."""
+# ----------------------------------------------------------------- 1. STT (lokal)
+def extract_audio_local() -> Path:
+    """Video -> WAV 16 kHz mono, satu file utuh (untuk faster-whisper).
+
+    Whisper lokal tidak punya batas ukuran file: memorinya terikat pada jendela
+    30 detik, bukan panjang audio. Jadi tidak perlu dipecah.
+    """
+    out = WORK / "audio.wav"
+    run(["ffmpeg", "-y", "-i", VIDEO, "-vn", "-ac", "1", "-ar", "16000",
+         "-c:a", "pcm_s16le", out])
+    return out
+
+
+def extract_audio_groq():
+    """Video -> MP3 48k mono, dipecah per 20 menit bila > 24 MB.
+
+    Return list[(path, offset_detik)]. Pemecahan ini hanya perlu untuk Groq yang
+    membatasi ukuran unggahan 24 MB; offset dipakai agar timestamp antar-chunk
+    tetap nyambung jadi satu timeline.
+    """
     full = WORK / "audio.mp3"
     run(["ffmpeg", "-y", "-i", VIDEO, "-vn", "-ac", "1", "-ar", "16000",
          "-c:a", "libmp3lame", "-b:a", "48k", full])
-    if full.stat().st_size <= 24 * 1024 * 1024:
+    if full.stat().st_size <= GROQ_MAX_BYTES:
         return [(full, 0.0)]
 
-    run(["ffmpeg", "-y", "-i", full, "-f", "segment", "-segment_time", "1200",
+    print(f"[stt] audio {full.stat().st_size / 1e6:.1f} MB > "
+          f"{GROQ_MAX_BYTES / 1e6:.0f} MB (batas Groq) "
+          f"-> dipecah per {GROQ_CHUNK_SECONDS}s")
+    run(["ffmpeg", "-y", "-i", full, "-f", "segment",
+         "-segment_time", str(GROQ_CHUNK_SECONDS),
          "-reset_timestamps", "1", "-c:a", "libmp3lame", "-b:a", "48k",
          WORK / "chunk_%03d.mp3"])
     chunks, offset, res = sorted(WORK.glob("chunk_*.mp3")), 0.0, []
     for c in chunks:
+        # Kalau durasi audio kelipatan persis segment_time, ffmpeg bisa
+        # meninggalkan chunk terakhir berisi header saja (~200-500 byte, durasi 0).
+        # Mengirimnya ke Groq cuma menghabiskan 1 request kuota dan berisiko
+        # menyisipkan segmen kosong di ujung timeline.
+        if c.stat().st_size <= 1024:
+            print(f"[stt] lewati {c.name} ({c.stat().st_size} byte, chunk kosong)")
+            continue
         res.append((c, offset))
         offset += probe_duration(c)
+    if not res:
+        sys.exit("[stt] tidak ada chunk audio yang valid untuk dikirim ke Groq")
     return res
 
 
+def load_stt_model():
+    """Load (dan download kalau perlu) model faster-whisper. Sekali per proses."""
+    global _STT
+    if _STT is None:
+        with _STT_LOCK:
+            if _STT is None:                      # double-checked locking
+                from faster_whisper import WhisperModel
+                STT_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+                t0 = time.time()
+                try:
+                    _STT = WhisperModel(
+                        STT_MODEL, device=STT_DEVICE,
+                        compute_type=STT_COMPUTE_TYPE,
+                        cpu_threads=STT_THREADS,
+                        download_root=str(STT_MODEL_DIR))
+                except Exception as e:  # noqa: BLE001
+                    sys.exit(
+                        f"[stt] gagal memuat model '{STT_MODEL}': "
+                        f"{type(e).__name__}: {e}\n"
+                        f"  - Nama model valid: tiny, base, small, medium, large-v3,\n"
+                        f"    large-v3-turbo, distil-large-v3 (atau path direktori CT2).\n"
+                        f"  - Kalau download dari huggingface.co gagal, jalankan ulang\n"
+                        f"    (model di-cache di {STT_MODEL_DIR}/).\n"
+                        f"  - Kalau proses di-kill (OOM), pakai STT_COMPUTE_TYPE=int8\n"
+                        f"    dan model lebih kecil, mis. STT_MODEL=small.")
+                print(f"[stt] model {STT_MODEL} siap dalam {time.time() - t0:.1f}s "
+                      f"(device={STT_DEVICE}, compute={STT_COMPUTE_TYPE}, "
+                      f"threads={STT_THREADS or 'auto'})")
+    return _STT
+
+
 def groq_transcribe(path: Path) -> dict:
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    """POST audio ke Groq Whisper. Retry untuk 429/5xx, hormati retry-after."""
+    if not GROQ_KEY:
+        sys.exit("[stt] STT_PROVIDER=groq tapi secret GROQ_API_KEY kosong.\n"
+                 "  Isi secret-nya, atau set STT_PROVIDER=local / input "
+                 "stt_provider=local untuk pakai faster-whisper di runner.")
     r = None
     for attempt in range(5):
         with open(path, "rb") as f:
             r = requests.post(
-                url,
+                GROQ_STT_URL,
                 headers={"Authorization": f"Bearer {GROQ_KEY}"},
                 files={"file": (path.name, f)},
                 data={
-                    "model": STT_MODEL,
-                    "language": "id",
+                    "model": STT_GROQ_MODEL,
+                    "language": STT_LANGUAGE or "id",
                     "response_format": "verbose_json",
                     "temperature": "0",
                     "timestamp_granularities[]": "segment",
@@ -195,13 +334,56 @@ def groq_transcribe(path: Path) -> dict:
                 timeout=600,
             )
         if r.status_code == 429 or r.status_code >= 500:
-            wait = 5 * (2 ** attempt)
-            print(f"[groq] {r.status_code}, retry in {wait}s")
+            # retry-after dari server lebih akurat daripada backoff tebak-tebakan
+            try:
+                wait = min(max(float(r.headers.get("retry-after", "")), 1.0), 120.0)
+            except (TypeError, ValueError):
+                wait = 5 * (2 ** attempt)
+            sisa = r.headers.get("x-ratelimit-remaining-requests", "?")
+            print(f"[groq] {r.status_code}, retry dalam {wait:.0f}s "
+                  f"(sisa kuota harian: {sisa})")
+            if sisa == "0":
+                sys.exit(f"[groq] Kuota harian (RPD) habis untuk {STT_GROQ_MODEL}.\n"
+                         "  Tunggu reset, atau pakai stt_provider=local.")
             time.sleep(wait)
             continue
+        if r.status_code in (401, 403):
+            sys.exit(f"[groq] {r.status_code}: {r.text[:400]}\n"
+                     "  Secret GROQ_API_KEY tidak valid / tidak punya akses model ini.")
         r.raise_for_status()
         return r.json()
     r.raise_for_status()
+
+
+def transcribe_groq():
+    """STT lewat Groq Whisper API."""
+    video_dur = probe_duration(VIDEO)
+    parts = extract_audio_groq()
+    print(f"[stt] groq model={STT_GROQ_MODEL}, {len(parts)} berkas audio, "
+          f"video {video_dur:.1f}s")
+    segs = []
+    t0 = time.time()
+    for path, offset in parts:
+        print(f"[stt] {path.name} ({path.stat().st_size / 1e6:.1f} MB, "
+              f"offset {offset:.1f}s)")
+        data = groq_transcribe(path)
+        n = 0
+        for s in data.get("segments", []):
+            text = s["text"].strip()
+            if text:
+                segs.append({"start": s["start"] + offset,
+                             "end": s["end"] + offset,
+                             "src": text})
+                n += 1
+        print(f"[stt]   -> {n} segmen")
+    el = time.time() - t0
+    segs.sort(key=lambda x: x["start"])
+    print(f"[stt] selesai {el:.1f}s (RTF {el / max(video_dur, 0.1):.3f}x) | "
+          f"groq {STT_GROQ_MODEL} | {len(segs)} segmen mentah")
+    merged = merge_short(segs)
+    if len(merged) != len(segs):
+        print(f"[stt] merge_short: {len(segs)} -> {len(merged)} segmen")
+    return merged
 
 
 def merge_short(segs, min_dur=1.0, max_gap=0.4, max_len=12.0):
@@ -221,18 +403,65 @@ def merge_short(segs, min_dur=1.0, max_gap=0.4, max_len=12.0):
 
 
 def transcribe():
+    """Pilih jalur STT sesuai STT_PROVIDER."""
+    if STT_PROVIDER == "groq":
+        return transcribe_groq()
+    return transcribe_local()
+
+
+def transcribe_local():
+    """Transkripsi lokal dengan faster-whisper.
+
+    `segments` adalah generator: waktu diukur mengelilingi iterasinya, bukan
+    pemanggilan transcribe().
+    """
+    model = load_stt_model()
+    audio = extract_audio_local()
+    video_dur = probe_duration(VIDEO)
+    print(f"[stt] {audio.name} ({audio.stat().st_size / 1e6:.1f} MB, "
+          f"video {video_dur:.1f}s)")
+
+    vad_params = {"min_silence_duration_ms": 400} if STT_VAD else None
+    t0 = time.time()
+    segments, info = model.transcribe(
+        str(audio),
+        language=STT_LANGUAGE or None,
+        task="transcribe",
+        beam_size=STT_BEAM_SIZE,
+        vad_filter=STT_VAD,
+        vad_parameters=vad_params,
+        condition_on_previous_text=True,
+    )
     segs = []
-    for path, offset in extract_audio():
-        print(f"[stt] {path.name} (offset {offset:.1f}s)")
-        data = groq_transcribe(path)
-        for s in data.get("segments", []):
-            text = s["text"].strip()
+    try:
+        for s in segments:
+            text = s.text.strip()
             if text:
-                segs.append({"start": s["start"] + offset,
-                             "end": s["end"] + offset,
-                             "src": text})
+                segs.append({"start": float(s.start), "end": float(s.end), "src": text})
+    except (RuntimeError, MemoryError) as e:
+        # OOM muncul di SINI (saat encode/inference), bukan saat load model.
+        # ctranslate2 melaporkannya sebagai "mkl_malloc: failed to allocate memory".
+        msg = f"{type(e).__name__}: {e}"
+        hint = ""
+        if "alloc" in msg.lower() or "memory" in msg.lower() or isinstance(e, MemoryError):
+            hint = (
+                "\n  Ini kehabisan RAM saat inference. Urutan yang paling menolong:\n"
+                "    1. STT_THREADS=1        (tiap thread alokasikan buffer sendiri)\n"
+                "    2. STT_COMPUTE_TYPE=int8 (sudah default; jangan pakai float32)\n"
+                "    3. STT_MODEL=small lalu base (turbo ~3 GB, small ~1 GB, base ~0.5 GB)\n"
+                f"  Konfigurasi sekarang: model={STT_MODEL} compute={STT_COMPUTE_TYPE} "
+                f"threads={STT_THREADS or 'auto'}\n"
+                f"  Sebagian hasil sudah didapat: {len(segs)} segmen sebelum gagal.")
+        sys.exit(f"[stt] transkripsi gagal: {msg}{hint}")
+    el = time.time() - t0
     segs.sort(key=lambda x: x["start"])
-    return merge_short(segs)
+    print(f"[stt] selesai {el:.1f}s (RTF {el / max(video_dur, 0.1):.3f}x) | "
+          f"bahasa={info.language} p={info.language_probability:.2f} | "
+          f"{len(segs)} segmen mentah")
+    merged = merge_short(segs)
+    if len(merged) != len(segs):
+        print(f"[stt] merge_short: {len(segs)} -> {len(merged)} segmen")
+    return merged
 
 
 def compute_slots(segs, video_dur):
@@ -307,209 +536,52 @@ def shorten(text: str, target_chars: int) -> str:
         return text
 
 
-# ----------------------------------------------------------------- 3. TTS + fit
+# ----------------------------------------------------------------- 3. TTS (lokal) + fit
 TRIM = ("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,areverse,"
         "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,areverse")
 
 
 def to_wav(src: Path, dst: Path, tempo: float = 1.0):
-    """audio (mp3/wav) -> wav mono 24k, trim silence di ujung, opsional percepat (atempo).
+    """audio (wav Piper) -> wav mono 24k, trim silence di ujung, opsional percepat.
 
-    Dipanggil dari asyncio.to_thread, jadi pakai run_cmd (raise) bukan run (sys.exit):
-    SystemExit di dalam thread tidak tertangkap `except Exception`, sehingga akan
-    menembus logika retry/fallback TTS.
-
-    Ekstensi src sengaja generik (.audio): ffmpeg mendeteksi format dari ISI file,
-    jadi mp3 dari Edge TTS maupun wav dari Groq sama-sama terbaca.
+    Dipanggil dari asyncio.to_thread, jadi pakai run_cmd (raise) bukan run (sys.exit).
+    Piper menghasilkan 22050 Hz; di sini di-resample ke SR=24000 supaya seragam
+    dengan timeline assemble().
     """
     f = TRIM + (f",atempo={tempo:.4f}" if tempo > 1.0 else "")
-    run_cmd(["ffmpeg", "-y", "-i", src, "-af", f, "-ar", SR, "-ac", 1,
+    run_cmd(["ffmpeg", "-y", "-i", src, "-af", f, "-ar", SR, "-ac", "1",
              "-c:a", "pcm_s16le", dst])
     if wav_duration(dst) < 0.05:  # fallback bila trim menghabiskan semua audio
         f = f"atempo={tempo:.4f}" if tempo > 1.0 else "anull"
-        run_cmd(["ffmpeg", "-y", "-i", src, "-af", f, "-ar", SR, "-ac", 1,
+        run_cmd(["ffmpeg", "-y", "-i", src, "-af", f, "-ar", SR, "-ac", "1",
                  "-c:a", "pcm_s16le", dst])
 
 
-class TTSBlocked(RuntimeError):
-    """Provider menolak secara permanen -- jangan di-retry.
+def _download_file(url: str, dst: Path, tries: int = 3):
+    """Download atomik (tulis ke .part lalu rename) dengan retry.
 
-    Contoh: Edge TTS 403 (IP datacenter diblok Microsoft), Groq 401 (key salah),
-    atau kuota harian Groq (RPD) sudah habis.
+    Dipakai bersama oleh Piper dan Kokoro. Atomic rename penting supaya file
+    setengah jadi tidak dianggap cache valid oleh run berikutnya.
     """
-
-
-class GroqRateLimited(RuntimeError):
-    """429 dari Groq, disertai saran durasi tunggu dalam detik."""
-
-    def __init__(self, msg: str, wait: float = 0.0):
-        super().__init__(msg)
-        self.wait = wait
-
-
-class RateLimiter:
-    """Jaga jarak antar-request supaya tidak menembus RPM provider.
-
-    Groq Orpheus tier gratis cuma 10 RPM. Tanpa pembatas ini, 92 segmen
-    ditembakkan secepat mungkin dan hasilnya 42 dari 92 segmen kena 429
-    (run 38286526459). Thread-safe karena _groq_once jalan di to_thread.
-    """
-
-    def __init__(self, rpm: int):
-        self.rpm = max(1, rpm)
-        self.interval = 60.0 / self.rpm
-        self._lock = threading.Lock()
-        self._next_at = 0.0
-
-    def acquire(self):
-        with self._lock:
-            now = time.monotonic()
-            wait = max(0.0, self._next_at - now)
-            self._next_at = max(now, self._next_at) + self.interval
-        if wait > 0:
-            time.sleep(wait)
-
-
-_GROQ_LIMITER = RateLimiter(GROQ_RPM)
-
-# Body error API dipotong sepanjang ini. Dulu 200 karakter, yang membuat URL
-# "terms acceptance" dari Groq terpotong sehingga tidak bisa ditindaklanjuti.
-ERR_BODY_LIMIT = 600
-
-
-def _err_body(r) -> str:
-    """Ambil error.message kalau responsnya JSON, kalau tidak potong body mentah."""
-    if "json" in r.headers.get("content-type", ""):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() and dst.stat().st_size > 0:
+        return dst
+    tmp = dst.parent / (dst.name + ".part")
+    for attempt in range(tries):
         try:
-            return str(r.json()["error"]["message"])[:ERR_BODY_LIMIT]
-        except Exception:  # noqa: BLE001
-            pass
-    return r.text[:ERR_BODY_LIMIT]
+            print(f"[model] download {url}")
+            urllib.request.urlretrieve(url, tmp)
+            tmp.replace(dst)
+            print(f"[model] {dst.name}: {dst.stat().st_size / 1e6:.1f} MB")
+            return dst
+        except Exception as e:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            if attempt == tries - 1:
+                raise RuntimeError(f"gagal download {dst.name} dari {url}: {e}") from e
+            time.sleep(3 * (attempt + 1))
+    return dst
 
 
-def _retry_after(r, default: float = 20.0) -> float:
-    """Header retry-after (detik) yang dikirim Groq saat 429."""
-    try:
-        return min(max(float(r.headers.get("retry-after", "")), 1.0), 120.0)
-    except (TypeError, ValueError):
-        return default
-
-
-def _is_blocked(err: BaseException) -> bool:
-    s = f"{type(err).__name__}: {err}"
-    return ("403" in s or "Invalid response status" in s
-            or "WSServerHandshakeError" in s or "Forbidden" in s)
-
-
-# --- provider: Edge TTS --------------------------------------------------
-async def _edge_once(text: str, out: Path):
-    import edge_tts  # lazy: tidak dibutuhkan saat TTS_PROVIDER=groq
-    await edge_tts.Communicate(text, VOICE, rate=RATE).save(str(out))
-
-
-# --- provider: Groq Orpheus ---------------------------------------------
-def split_chunks(text: str, limit: int = GROQ_CHAR_LIMIT):
-    """Pecah teks jadi <= `limit` karakter, utamakan batas kalimat lalu spasi.
-
-    Orpheus menolak input > 200 karakter, jadi segmen panjang wajib dipecah.
-    """
-    text = " ".join(text.split())
-    if len(text) <= limit:
-        return [text] if text else []
-    out, cur = [], ""
-    for sent in re.split(r"(?<=[.!?])\s+", text):
-        sent = sent.strip()
-        while len(sent) > limit:            # satu kalimat pun kepanjangan -> potong paksa
-            cut = sent.rfind(" ", 0, limit)
-            if cut <= 0:
-                cut = limit
-            if cur:
-                out.append(cur)
-                cur = ""
-            out.append(sent[:cut].strip())
-            sent = sent[cut:].strip()
-        if not sent:
-            continue
-        if cur and len(cur) + 1 + len(sent) > limit:
-            out.append(cur)
-            cur = sent
-        else:
-            cur = f"{cur} {sent}".strip()
-    if cur:
-        out.append(cur)
-    return out or [text[:limit]]
-
-
-def _concat_wav(parts, out: Path):
-    """Gabung beberapa wav jadi satu.
-
-    `-f wav` WAJIB eksplisit: `out` berekstensi .audio dan ffmpeg menolak menebak
-    muxer dari ekstensi tak dikenal ("Unable to choose an output format").
-    Re-encode ke 24k mono sekaligus menormalkan parameter antar-chunk.
-    """
-    lst = out.parent / (out.stem + ".concat.txt")
-    lst.write_text("".join(f"file '{p.resolve()}'\n" for p in parts), encoding="utf-8")
-    try:
-        run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
-                 "-f", "wav", "-ar", str(SR), "-ac", "1", "-c:a", "pcm_s16le", out])
-    finally:
-        lst.unlink(missing_ok=True)
-
-
-def _groq_once(text: str, out: Path):
-    """POST ke Groq audio/speech. Output WAV; kalau teks dipecah, hasil di-concat."""
-    global _GROQ_DAILY_EXHAUSTED
-    if not GROQ_KEY:
-        raise TTSBlocked("GROQ_API_KEY kosong, tidak bisa fallback ke Groq TTS")
-    if _GROQ_DAILY_EXHAUSTED:
-        raise TTSBlocked("Kuota harian Groq (RPD) sudah habis -- lihat pesan sebelumnya")
-    chunks = split_chunks(text) or [""]
-    parts = []
-    try:
-        for n, ch in enumerate(chunks):
-            _GROQ_LIMITER.acquire()   # jaga jarak request, hormati RPM
-            r = requests.post(
-                GROQ_TTS_URL,
-                headers={"Authorization": f"Bearer {GROQ_KEY}",
-                         "Content-Type": "application/json"},
-                json={"model": GROQ_TTS_MODEL, "voice": GROQ_TTS_VOICE,
-                      "input": ch, "response_format": "wav"},
-                timeout=180,
-            )
-            body = _err_body(r)
-            if r.status_code in (401, 403):
-                raise TTSBlocked(f"Groq TTS {r.status_code}: {body}")
-            if r.status_code == 429:
-                # x-ratelimit-remaining-requests = sisa kuota HARIAN (RPD).
-                # Kalau 0, retry sampai kapan pun tidak akan berhasil.
-                if r.headers.get("x-ratelimit-remaining-requests") == "0":
-                    _GROQ_DAILY_EXHAUSTED = True
-                    raise TTSBlocked(
-                        "Kuota harian Groq (RPD=100) habis. Orpheus tier gratis "
-                        "tidak cukup untuk video panjang: 92 segmen = 92 request. "
-                        "Pakai TTS_PROVIDER=piper (lokal, tanpa kuota), upgrade "
-                        "plan Groq, atau tunggu reset tengah malam.")
-                wait = _retry_after(r)
-                raise GroqRateLimited(f"Groq TTS 429: {body} (tunggu {wait:.0f}s)", wait)
-            if r.status_code >= 500:
-                raise RuntimeError(f"Groq TTS {r.status_code}: {body}")
-            r.raise_for_status()
-            p = out.parent / f"{out.stem}.part{n}.wav"
-            p.write_bytes(r.content)
-            parts.append(p)
-        if not parts:
-            raise RuntimeError("Groq TTS tidak menghasilkan audio")
-        if len(parts) == 1:
-            parts[0].replace(out)
-            parts = []
-        else:
-            _concat_wav(parts, out)
-    finally:
-        for p in parts:
-            p.unlink(missing_ok=True)
-
-
-# --- provider: Piper TTS (lokal, offline, tanpa kuota) -------------------
 def _piper_ensure_model(name: str) -> Path:
     """Pastikan model suara Piper tersedia; download dari HuggingFace kalau belum.
 
@@ -520,13 +592,13 @@ def _piper_ensure_model(name: str) -> Path:
     if name.endswith(".onnx"):
         direct = Path(name)
         if not direct.is_file():
-            raise TTSBlocked(f"Model Piper tidak ditemukan: {direct}")
+            raise RuntimeError(f"Model Piper tidak ditemukan: {direct}")
         return direct
 
     parts = name.split("-")
     if len(parts) != 3:
-        raise TTSBlocked(
-            f"TTS_PIPER_VOICE '{name}' tidak valid. Format: <lang>_<US>-<nama>-"
+        raise ValueError(
+            f"TTS_PIPER_VOICE '{name}' tidak valid. Format: <lang>_<REGION>-<nama>-"
             f"<kualitas>, contoh en_US-lessac-medium")
     lang, vname, quality = parts
     family = lang.split("_")[0]
@@ -534,23 +606,8 @@ def _piper_ensure_model(name: str) -> Path:
 
     PIPER_DIR.mkdir(parents=True, exist_ok=True)
     onnx = PIPER_DIR / f"{name}.onnx"
-    for dst, url in ((PIPER_DIR / f"{name}.onnx.json", base + ".onnx.json"),
-                     (onnx, base + ".onnx")):
-        if dst.exists() and dst.stat().st_size > 0:
-            continue
-        tmp = dst.parent / (dst.name + ".part")
-        for attempt in range(3):
-            try:
-                print(f"[piper] download {url}")
-                urllib.request.urlretrieve(url, tmp)
-                tmp.replace(dst)
-                break
-            except Exception as e:  # noqa: BLE001
-                tmp.unlink(missing_ok=True)
-                if attempt == 2:
-                    raise RuntimeError(
-                        f"gagal download voice Piper '{name}' dari {url}: {e}") from e
-                time.sleep(3 * (attempt + 1))
+    _download_file(base + ".onnx.json", PIPER_DIR / f"{name}.onnx.json")
+    _download_file(base + ".onnx", onnx)
     return onnx
 
 
@@ -559,8 +616,8 @@ def _piper_get_voice():
     global _PIPER_VOICE
     if _PIPER_VOICE is None:
         with _PIPER_LOCK:
-            if _PIPER_VOICE is None:          # double-checked locking
-                from piper import PiperVoice   # lazy: onnxruntime berat
+            if _PIPER_VOICE is None:              # double-checked locking
+                from piper import PiperVoice      # lazy: onnxruntime berat
                 onnx = _piper_ensure_model(PIPER_VOICE)
                 t0 = time.time()
                 _PIPER_VOICE = PiperVoice.load(str(onnx))
@@ -578,7 +635,8 @@ def _piper_once(text: str, out: Path):
         try:
             cfg = SynthesisConfig(length_scale=float(PIPER_LENGTH_SCALE))
         except ValueError:
-            print(f"[piper] TTS_PIPER_LENGTH_SCALE '{PIPER_LENGTH_SCALE}' bukan angka, diabaikan")
+            print(f"[piper] TTS_PIPER_LENGTH_SCALE '{PIPER_LENGTH_SCALE}' "
+                  "bukan angka, diabaikan")
     tmp = out.parent / (out.stem + ".piper.part.wav")
     with wave.open(str(tmp), "wb") as wf:
         voice.synthesize_wav(text, wf, syn_config=cfg)
@@ -588,125 +646,216 @@ def _piper_once(text: str, out: Path):
     tmp.replace(out)
 
 
-# --- dispatcher ----------------------------------------------------------
-def _provider_chain():
-    """Urutan provider yang boleh dicoba untuk segmen ini."""
-    if TTS_PROVIDER in ("edge", "groq", "piper"):
-        return [TTS_PROVIDER]
-    # auto: Edge (kualitas terbaik, gratis) -> Piper (lokal, selalu jalan)
-    #       -> Groq (hanya kalau ada key dan kuota harian belum habis)
-    chain = []
-    if not _EDGE_BLOCKED:
-        chain.append("edge")
-    chain.append("piper")
-    if GROQ_KEY and not _GROQ_DAILY_EXHAUSTED:
-        chain.append("groq")
-    return chain
+# --- provider: Kokoro-82M (opsi) ----------------------------------------
+def kokoro_split(text: str, limit: int = None):
+    """Pecah teks per batas kalimat supaya tidak melewati KOKORO_MAX_CHARS.
+
+    Kokoro tidak punya batas karakter keras seperti Orpheus (batasnya 510 fonem
+    dan dipecah sendiri oleh kokoro-onnx), TAPI alokasi memorinya tumbuh seiring
+    panjang input. Memecah di sini membuat pemakaian RAM tiap panggilan terikat
+    dan bisa diprediksi.
+    """
+    limit = limit or KOKORO_MAX_CHARS
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return [text] if text else []
+    parts, cur = [], ""
+    for sent in re.split(r"(?<=[.!?;:])\s+", text):
+        sent = sent.strip()
+        while len(sent) > limit:
+            cut = sent.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(sent[:cut].strip())
+            sent = sent[cut:].strip()
+        if not sent:
+            continue
+        if cur and len(cur) + 1 + len(sent) > limit:
+            parts.append(cur)
+            cur = sent
+        else:
+            cur = f"{cur} {sent}".strip()
+    if cur:
+        parts.append(cur)
+    return parts or [text[:limit]]
 
 
-# Jeda antar percobaan (detik) per provider. Groq dibatasi per MENIT, jadi
-# backoff pendek ala Edge (2/4/6s) tidak akan pernah berhasil di sana.
-BACKOFF = {"edge": 2.0, "groq": 20.0, "piper": 1.0}
+def _kokoro_ensure_model():
+    """Pastikan model + voices Kokoro tersedia di KOKORO_DIR."""
+    low = KOKORO_MODEL_FILE.lower()
+    if "fp16" in low or "q8f16" in low or "q4f16" in low:
+        print(f"[kokoro] PERINGATAN: '{KOKORO_MODEL_FILE}' memakai bobot fp16 dan "
+              "TERUKUR SEGFAULT di onnxruntime CPU (bukan exception Python, jadi "
+              "tidak bisa ditangkap). Pakai kokoro-v1.0.int8.onnx (default) atau "
+              "kokoro-v1.0.onnx (fp32).")
+    KOKORO_DIR.mkdir(parents=True, exist_ok=True)
+    voices = _download_file(f"{KOKORO_BASE_URL}/{KOKORO_VOICES_FILE}",
+                            KOKORO_DIR / KOKORO_VOICES_FILE)
+    model = _download_file(f"{KOKORO_BASE_URL}/{KOKORO_MODEL_FILE}",
+                           KOKORO_DIR / KOKORO_MODEL_FILE)
+    return model, voices
+
+
+def _kokoro_get():
+    """Load Kokoro sekali per proses. Thread-safe: dipanggil dari to_thread."""
+    global _KOKORO
+    if _KOKORO is None:
+        with _KOKORO_LOCK:
+            if _KOKORO is None:                 # double-checked locking
+                from kokoro_onnx import Kokoro   # lazy: tidak perlu untuk piper
+                model, voices = _kokoro_ensure_model()
+                t0 = time.time()
+                inst = Kokoro(str(model), str(voices))
+                avail = inst.get_voices()
+                # Validasi SEBELUM assign ke _KOKORO. Kalau assign lebih dulu lalu
+                # raise, retry berikutnya melihat _KOKORO sudah terisi dan melewati
+                # validasi ini -- yang muncul malah ValueError internal kokoro_onnx
+                # ("Voice X not found in available voices") tanpa daftar pilihan.
+                if KOKORO_VOICE not in avail:
+                    raise RuntimeError(
+                        f"Voice Kokoro '{KOKORO_VOICE}' tidak ada. "
+                        f"{len(avail)} pilihan tersedia, mis: "
+                        f"{', '.join(sorted(avail)[:20])} ...")
+                _KOKORO = inst
+                print(f"[kokoro] model siap dalam {time.time() - t0:.1f}s "
+                      f"(voice {KOKORO_VOICE}, {len(avail)} voice tersedia, "
+                      f"lang={KOKORO_LANG}, speed={KOKORO_SPEED})")
+    return _KOKORO
+
+
+def _kokoro_once(text: str, out: Path):
+    """Sintesis Kokoro -> WAV 24 kHz. Output-nya sudah persis SR pipeline."""
+    import numpy as np
+    k = _kokoro_get()
+    pieces = []
+    for part in kokoro_split(text):
+        audio, sr = k.create(part, voice=KOKORO_VOICE,
+                             speed=KOKORO_SPEED, lang=KOKORO_LANG)
+        if audio is None or len(audio) == 0:
+            raise RuntimeError(f"Kokoro menghasilkan audio kosong untuk: {part!r}")
+        pieces.append((np.asarray(audio, dtype=np.float32), sr))
+    if not pieces:
+        raise RuntimeError("Kokoro tidak menghasilkan audio")
+    # gabung di level array (bukan ffmpeg): semua piece sr-nya sama
+    sr = pieces[0][1]
+    merged = pieces[0][0] if len(pieces) == 1 else np.concatenate([p[0] for p in pieces])
+    pcm = (np.clip(merged, -1.0, 1.0) * 32767).astype(np.int16)
+    tmp = out.parent / (out.stem + ".kokoro.part.wav")
+    with wave.open(str(tmp), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+    if not tmp.exists() or tmp.stat().st_size < 100:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("Kokoro menghasilkan audio kosong")
+    tmp.replace(out)
+
+
+def _tts_impl():
+    """Fungsi sintesis untuk provider yang dipilih."""
+    if TTS_PROVIDER == "kokoro":
+        return _kokoro_once
+    if TTS_PROVIDER != "piper":
+        raise RuntimeError(
+            f"TTS_PROVIDER '{TTS_PROVIDER}' tidak dikenal. Pilihan: piper, kokoro.")
+    return _piper_once
 
 
 async def tts(text: str, out: Path, sem: asyncio.Semaphore) -> str:
-    """Generate TTS ke `out`. Return nama provider yang berhasil."""
-    global _EDGE_BLOCKED, _ACTIVE_PROVIDER
+    """Sintesis satu segmen ke `out`. Return nama provider kalau berhasil."""
+    impl = _tts_impl()
     async with sem:
-        chain = _provider_chain()
         last = None
-        for prov in chain:
-            tries = {"edge": EDGE_TRIES, "groq": GROQ_TRIES,
-                     "piper": PIPER_TRIES}[prov]
-            for attempt in range(tries):
-                try:
-                    if prov == "edge":
-                        coro = _edge_once(text, out)
-                    elif prov == "groq":
-                        coro = asyncio.to_thread(_groq_once, text, out)
-                    else:
-                        coro = asyncio.to_thread(_piper_once, text, out)
-                    # wait_for: koneksi yang menggantung tidak boleh memblokir selamanya
-                    await asyncio.wait_for(coro, timeout=TTS_TIMEOUT)
-                    if out.exists() and out.stat().st_size > 0:
-                        if prov != _ACTIVE_PROVIDER:
-                            if _ACTIVE_PROVIDER != "?":
-                                print(f"[tts] provider aktif -> {prov}")
-                            _ACTIVE_PROVIDER = prov
-                        return prov
-                    last = RuntimeError("hasil TTS kosong")
-                except asyncio.TimeoutError:
-                    last = RuntimeError(f"timeout >{TTS_TIMEOUT:.0f}s")
-                except GroqRateLimited as e:
-                    # 429 sementara: tunggu sesuai retry-after dari server.
-                    last = e
-                    await asyncio.sleep(e.wait)
-                    continue
-                except TTSBlocked as e:
-                    # Permanen untuk provider ini -> jangan retry, pindah saja.
-                    last = e
-                    if prov == "edge" and not _EDGE_BLOCKED:
-                        _EDGE_BLOCKED = True
-                        sisa = chain[chain.index(prov) + 1:] or ["(tidak ada)"]
-                        print(f"[tts] Edge TTS diblok (403 / IP datacenter) "
-                              f"-> pindah permanen ke: {sisa[0]}")
-                    elif prov == "groq":
-                        print(f"[tts] Groq tidak bisa dipakai: {str(e)[:200]}")
-                    break
-                except Exception as e:  # noqa: BLE001
-                    last = e
-                    if prov == "edge" and _is_blocked(e):
-                        if not _EDGE_BLOCKED:
-                            _EDGE_BLOCKED = True
-                            sisa = chain[chain.index(prov) + 1:] or ["(tidak ada)"]
-                            print(f"[tts] Edge TTS diblok (403 / IP datacenter) "
-                                  f"-> pindah permanen ke: {sisa[0]}")
-                        break
-                if attempt < tries - 1:
-                    await asyncio.sleep(min(BACKOFF[prov] * (attempt + 1), 60.0))
-        raise RuntimeError(f"TTS gagal untuk: {text!r} via {chain} ({last})")
+        for attempt in range(TTS_TRIES):
+            try:
+                # wait_for: sintesis yang menggantung tidak boleh memblokir selamanya
+                await asyncio.wait_for(asyncio.to_thread(impl, text, out),
+                                       timeout=TTS_TIMEOUT)
+                if out.exists() and out.stat().st_size > 0:
+                    return TTS_PROVIDER
+                last = RuntimeError("hasil TTS kosong")
+            except asyncio.TimeoutError:
+                last = RuntimeError(f"timeout >{TTS_TIMEOUT:.0f}s")
+            except Exception as e:  # noqa: BLE001
+                last = e
+            if attempt < TTS_TRIES - 1:
+                await asyncio.sleep(TTS_BACKOFF * (attempt + 1))
+        raise RuntimeError(f"{TTS_PROVIDER} TTS gagal untuk: {text!r} ({last})")
 
 
 async def preflight_tts():
-    """Tes provider SEBELUM menghabiskan kuota Groq STT + LLM translate.
+    """Tes TTS SEBELUM menghabiskan waktu STT + kuota LLM translate.
 
-    Tanpa ini, run baru ketahuan TTS-nya mati setelah 3-5 menit dan setelah
-    40-92 segmen Whisper + terjemahan terbuang.
+    Tanpa ini, run baru tahu TTS-nya mati setelah beberapa menit dan setelah
+    puluhan segmen terjemahan terbuang (yang terjadi sebelum preflight ada).
     """
-    global _ACTIVE_PROVIDER
-    probe = WORK / "_preflight.audio"
+    probe = WORK / "_preflight.wav"
+    _tts_impl()   # validasi TTS_PROVIDER lebih awal, pesan error jelas
     sem = asyncio.Semaphore(1)
     t0 = time.time()
     try:
-        prov = await asyncio.wait_for(
+        await asyncio.wait_for(
             tts("Preflight check for the dubbing pipeline.", probe, sem),
-            timeout=TTS_TIMEOUT * 2 + 30)
-        print(f"[preflight] TTS OK via {prov} dalam {time.time() - t0:.1f}s")
-        _ACTIVE_PROVIDER = prov
+            timeout=TTS_TIMEOUT * 2 + 60)
+        detail = (f"voice {PIPER_VOICE}" if TTS_PROVIDER == "piper"
+                  else f"voice {KOKORO_VOICE}, lang {KOKORO_LANG}")
+        print(f"[preflight] {TTS_PROVIDER} TTS OK dalam {time.time() - t0:.1f}s ({detail})")
     except Exception as e:  # noqa: BLE001
-        sys.exit(f"[preflight] Semua provider TTS gagal ({_provider_chain()}): {e}\n"
-                 "Edge TTS 403 = IP runner diblok Microsoft. Set TTS_PROVIDER=groq "
-                 "dan pastikan GROQ_API_KEY terisi, atau pakai proxy/self-hosted runner.")
+        if TTS_PROVIDER == "kokoro":
+            hint = ("  - Voice Kokoro harus salah satu dari 54 nama bawaan, mis.\n"
+                    "    af_bella, af_sarah, am_adam, am_michael, bm_george.\n"
+                    "  - Model HARUS varian int8/fp32. Varian fp16 (q8f16/q4f16/fp16)\n"
+                    "    terukur SEGFAULT di onnxruntime CPU dan tidak bisa ditangkap.\n"
+                    "  - Kalau 'Failed to allocate memory': teks terlalu panjang atau\n"
+                    "    RAM kurang. Turunkan TTS_KOKORO_MAX_CHARS.")
+        else:
+            hint = ("  - Cek nama voice (format en_US-lessac-medium) dan akses ke\n"
+                    "    huggingface.co dari runner.\n"
+                    "  - Kalau proses di-kill tanpa pesan: onnxruntime kehabisan memori.")
+        sys.exit(f"[preflight] {TTS_PROVIDER} TTS gagal: {type(e).__name__}: {e}\n{hint}")
     finally:
         probe.unlink(missing_ok=True)
 
 
+def tts_signature(text: str) -> str:
+    """Identitas lengkap sebuah hasil sintesis: provider + voice + parameter + teks.
+
+    WAJIB memuat provider dan voice. Kalau tag hanya berisi teks, mengganti
+    tts_provider atau voice akan diam-diam memakai ulang audio provider lama dari
+    cache -- video hasilnya bersuara provider yang salah tanpa peringatan apa pun,
+    dan pengujian provider baru akan "lulus" padahal tidak pernah dijalankan.
+
+    Perubahan format ini juga otomatis menginvalidasi cache lama (yang hanya
+    berisi teks), dan itu arah yang aman: regenerate, bukan pakai yang basi.
+    """
+    if TTS_PROVIDER == "kokoro":
+        cfg = f"kokoro|{KOKORO_VOICE}|{KOKORO_LANG}|{KOKORO_SPEED}"
+    else:
+        cfg = f"piper|{PIPER_VOICE}|{PIPER_LENGTH_SCALE or 'default'}"
+    return f"{cfg}|{text}"
+
+
 async def build_clip(i: int, seg: dict, sem: asyncio.Semaphore):
-    aud = WORK / f"tts_{i:04d}.audio"   # mp3 (edge) atau wav (groq); ffmpeg sniff isi
+    aud = WORK / f"tts_{i:04d}.audio"   # wav dari Piper/Kokoro; ffmpeg sniff isi file
     wav = WORK / f"clip_{i:04d}.wav"
-    tag = WORK / f"tts_{i:04d}.txt"     # isi = teks yang dipakai -> invalidasi cache
+    tag = WORK / f"tts_{i:04d}.txt"     # isi = tts_signature() -> invalidasi cache
     slot = seg["slot"]
     text = seg["en"]
 
     def cached(t: str) -> bool:
         return (aud.exists() and aud.stat().st_size > 0
-                and tag.exists() and tag.read_text(encoding="utf-8") == t)
+                and tag.exists()
+                and tag.read_text(encoding="utf-8") == tts_signature(t))
 
     if cached(text):
         prov = "cache"
     else:
         prov = await tts(text, aud, sem)
-        tag.write_text(text, encoding="utf-8")
+        tag.write_text(tts_signature(text), encoding="utf-8")
     await asyncio.to_thread(to_wav, aud, wav)
     dur = wav_duration(wav)
     info = prov
@@ -719,7 +868,7 @@ async def build_clip(i: int, seg: dict, sem: asyncio.Semaphore):
             text = new_text
             if not cached(text):
                 prov = await tts(text, aud, sem)
-                tag.write_text(text, encoding="utf-8")
+                tag.write_text(tts_signature(text), encoding="utf-8")
             await asyncio.to_thread(to_wav, aud, wav)
             dur = wav_duration(wav)
             info = f"{prov}+shortened"
@@ -757,16 +906,12 @@ async def build_all(segs):
                    "error": f"{type(r).__name__}: {r}"} for i, r in failed]
         (OUT / "tts_failures.json").write_text(
             json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"\n[tts] GAGAL {len(failed)}/{len(segs)} segmen. "
-              f"Provider terakhir: {_ACTIVE_PROVIDER}")
+        print(f"\n[tts] GAGAL {len(failed)}/{len(segs)} segmen")
         for i, r in failed[:8]:
             print(f"  #{i:04d}: {type(r).__name__}: {str(r)[:180]}")
         if len(failed) > 8:
             print(f"  ... dan {len(failed) - 8} lainnya")
         print("  detail lengkap: output/tts_failures.json")
-        if _EDGE_BLOCKED and not GROQ_KEY:
-            print("  HINT: Edge TTS kena 403 (IP runner diblok) dan GROQ_API_KEY kosong. "
-                  "Set secret GROQ_API_KEY agar fallback aktif.")
         raise SystemExit(2)
     return res
 
@@ -892,19 +1037,36 @@ def load_state(video_sha: str):
     except Exception as e:  # noqa: BLE001
         print(f"[cache] state.json tidak bisa dibaca, hitung ulang ({e})")
         return None
-    if (st.get("video_sha") == video_sha
-            and st.get("stt_model") == STT_MODEL
-            and st.get("llm_model") == LLM_MODEL
-            and isinstance(st.get("segments"), list) and st["segments"]
-            and all(s.get("en") for s in st["segments"])):
-        return st["segments"]
-    print("[cache] state.json tidak cocok (video/model beda) -> hitung ulang")
+    alasan = []
+    if st.get("video_sha") != video_sha:
+        alasan.append(f"video_sha {str(st.get('video_sha'))[:12]}.. != {video_sha[:12]}..")
+    if st.get("stt_effective") != STT_EFFECTIVE:
+        alasan.append(f"stt {st.get('stt_effective') or st.get('stt_model')!r} "
+                      f"!= {STT_EFFECTIVE!r}")
+    if st.get("llm_model") != LLM_MODEL:
+        alasan.append(f"llm_model {st.get('llm_model')!r} != {LLM_MODEL!r}")
+    seg = st.get("segments")
+    if not isinstance(seg, list) or not seg:
+        alasan.append("segments kosong/bukan list")
+    else:
+        kosong = sum(1 for s in seg if not s.get("en"))
+        if kosong:
+            alasan.append(f"{kosong} segmen tanpa terjemahan 'en'")
+    if not alasan:
+        return seg
+    print(f"[cache] state.json DITOLAK -> hitung ulang. Alasan: {'; '.join(alasan)}")
     return None
 
 
 def save_state(video_sha: str, segs):
     STATE.write_text(json.dumps({
         "video_sha": video_sha,
+        # stt_effective = "<provider>:<model>". WAJIB memuat provider: transkrip
+        # groq whisper-large-v3 dan local large-v3-turbo berbeda, jadi saling
+        # menggantikan dari cache akan menghasilkan dubbing yang salah diam-diam.
+        # (Kelas bug yang sama dengan tag cache TTS yang dulu hanya berisi teks.)
+        "stt_effective": STT_EFFECTIVE,
+        "stt_provider": STT_PROVIDER,
         "stt_model": STT_MODEL,
         "llm_model": LLM_MODEL,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -917,44 +1079,79 @@ def main():
     global llm
     if not VIDEO.is_file():
         sys.exit(f"Video tidak ditemukan: {VIDEO}")
-    if not GROQ_KEY:
-        sys.exit("GROQ_API_KEY belum di-set")
     if not LLM_KEY:
         sys.exit("LLM_API_KEY belum di-set")
+    if STT_PROVIDER == "groq" and not GROQ_KEY:
+        sys.exit("STT_PROVIDER=groq tapi GROQ_API_KEY belum di-set.\n"
+                 "  Isi secret GROQ_API_KEY, atau pakai stt_provider=local.")
     llm = OpenAI(api_key=LLM_KEY, base_url=LLM_BASE or None)
 
     WORK.mkdir(exist_ok=True)
     OUT.mkdir(exist_ok=True)
 
     video_dur = probe_duration(VIDEO)
-    print(f"[init] video {video_dur:.1f}s, provider={TTS_PROVIDER}, "
-          f"max_speedup={MAX_SPEEDUP}")
-    print(f"[init] piper_voice={PIPER_VOICE}, edge_voice={VOICE}, "
-          f"groq_voice={GROQ_TTS_VOICE} (model={GROQ_TTS_MODEL}, rpm={GROQ_RPM})")
+    print(f"[init] video {video_dur:.1f}s, max_speedup={MAX_SPEEDUP}")
+    if STT_PROVIDER == "groq":
+        print(f"[init] STT cloud: provider=groq model={STT_GROQ_MODEL} "
+              f"lang={STT_LANGUAGE or 'id'}")
+    else:
+        print(f"[init] STT lokal: model={STT_MODEL} device={STT_DEVICE} "
+              f"compute={STT_COMPUTE_TYPE} vad={STT_VAD} "
+              f"lang={STT_LANGUAGE or 'auto'}")
+    if TTS_PROVIDER == "kokoro":
+        print(f"[init] TTS lokal: provider=kokoro voice={KOKORO_VOICE} "
+              f"lang={KOKORO_LANG} speed={KOKORO_SPEED} concurrency={TTS_CONCURRENCY}")
+        print(f"[init] catatan: Kokoro ~6x lebih lambat dari Piper "
+              f"(RTF ~1.4 vs ~0.23 di 2 vCPU)")
+    else:
+        print(f"[init] TTS lokal: provider=piper voice={PIPER_VOICE} "
+              f"concurrency={TTS_CONCURRENCY}")
+    # Label "satu-satunya cloud" hanya benar kalau STT-nya lokal. Dengan
+    # stt_provider=groq ada DUA panggilan cloud, dan menyebut sebaliknya akan
+    # menyesatkan saat membaca log untuk mendiagnosis biaya/kuota.
+    cloud = "cloud" if STT_PROVIDER == "groq" else "satu-satunya cloud"
+    print(f"[init] LLM ({cloud}): model={LLM_MODEL} "
+          f"base_url={LLM_BASE or '(default OpenAI)'}")
 
     video_sha = sha256_file(VIDEO)
     print(f"[init] sha256 video {video_sha[:16]}...")
 
-    # 0) Cek TTS dulu: murah (~2 detik), hemat kuota Groq+LLM kalau ternyata mati.
-    asyncio.run(preflight_tts())
+    t_start = time.time()
+    timing = {}          # nama fase -> detik, dicetak sebagai ringkasan di akhir
+    _mark = [t_start]
 
-    # 1-2) STT + translate (di-cache antar run untuk video yang sama)
+    def lap(name):
+        """Catat durasi fase sejak `lap` terakhir."""
+        now = time.time()
+        timing[name] = now - _mark[0]
+        _mark[0] = now
+        print(f"[waktu] {name:<22} {timing[name]:7.1f}s ({timing[name] / 60:.1f} mnt)")
+
+    # 0) Cek TTS dulu: murah (~2 detik), hemat waktu STT & kuota LLM kalau mati.
+    asyncio.run(preflight_tts())
+    lap("preflight TTS")
+
+    # 1-2) STT lokal + translate (di-cache antar run untuk video yang sama)
     segs = load_state(video_sha)
     if segs is not None:
         print(f"[cache] pakai ulang hasil STT+translate: {len(segs)} segmen "
-              "(skip Groq Whisper & LLM)")
+              "(skip faster-whisper & LLM)")
         compute_slots(segs, video_dur)
+        lap("STT+LLM (dari cache)")
     else:
         segs = transcribe()
         if not segs:
             sys.exit("Tidak ada ucapan terdeteksi")
         print(f"[stt] {len(segs)} segmen")
+        lap(f"STT {STT_PROVIDER}")
         compute_slots(segs, video_dur)
         translate(segs)
+        lap("LLM translate")
         save_state(video_sha, segs)
 
-    # 3) TTS
+    # 3) TTS lokal
     clips = asyncio.run(build_all(segs))
+    lap(f"TTS {TTS_PROVIDER}")
 
     # 4) assemble + mux
     dub_wav, dub_dur, placed = assemble(segs, clips, video_dur)
@@ -965,8 +1162,23 @@ def main():
     save_state(video_sha, segs)  # teks final (mungkin sudah di-shorten)
     (OUT / "segments.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
+    lap("assemble+mux+srt")
+    total = time.time() - t_start
+
+    # Ringkasan waktu per fase. Penting untuk membandingkan provider: tanpa ini
+    # hanya total yang terlihat, padahal STT dan TTS bisa bertukar porsi.
+    audio_dur = sum(c[1] for c in clips) if clips else 0.0
+    print("\n[ringkasan waktu]")
+    for name, sec in timing.items():
+        print(f"  {name:<22} {sec:7.1f}s  {100 * sec / total:5.1f}%")
+    print(f"  {'TOTAL':<22} {total:7.1f}s  ({total / 60:.1f} menit)")
+    t_tts = timing.get(f"TTS {TTS_PROVIDER}", 0.0)
+    if t_tts and audio_dur:
+        print(f"  RTF TTS terukur        {t_tts / audio_dur:7.3f}x "
+              f"({t_tts:.0f}s proses / {audio_dur:.0f}s audio, "
+              f"{len(segs)} segmen)")
     print(f"[done] output/dubbed.mp4, dubbed.en.srt, dub.wav, segments.json "
-          f"(TTS provider: {_ACTIVE_PROVIDER})")
+          f"| {len(segs)} segmen | total {total:.0f}s ({total / 60:.1f} menit)")
 
 
 if __name__ == "__main__":
