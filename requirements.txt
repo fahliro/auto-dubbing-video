@@ -8,13 +8,28 @@
 #   - Groq Orpheus TTS: tier gratis RPM=10, RPD=100. Video 92 segmen
 #                       menghabiskan kuota harian dalam satu run.
 #   - Groq Whisper    : RPM=20, RPD=2000, plus harus upload audio tiap run.
-#   ctranslate2 (Whisper) dan onnxruntime (Piper) jalan di CPU runner 4 vCPU /
-#   16 GB: tanpa API key, tanpa kuota, tanpa rate limit, tak bisa diblok per IP.
+#   ctranslate2 (Whisper) dan onnxruntime (Piper) jalan di CPU runner.
+#   Runner GitHub yang dipakai repo ini terukur 2 vCPU / 7 GB RAM (Python 3.12),
+#   jadi pilih model dengan kepala dingin -- lihat catatan STT_MODEL di workflow.
+#   Tanpa API key, tanpa kuota, tanpa rate limit, tak bisa diblokir per IP.
 # ---------------------------------------------------------------------------
 
-# STT lokal. Wheel cp39-abi3 manylinux; dependency ctranslate2 + av + huggingface-hub.
+# STT lokal. faster-whisper sendiri pure-python; yang biner ctranslate2 & av.
 # Model di-download sekali lalu di-cache oleh step "Cache model Whisper" di workflow.
 faster-whisper>=1.2.0
+
+# WAJIB di-pin < 19. JANGAN di-upgrade tanpa menjalankan workflow lebih dulu.
+#
+# faster_whisper.audio.decode_audio() memanggil:
+#     av.open(input_file, mode="r", metadata_errors="ignore")
+# PyAV 19 MENGHAPUS parameter `metadata_errors`, sehingga panggilannya jadi:
+#     TypeError: open() got an unexpected keyword argument 'metadata_errors'
+# faster-whisper 1.2.1 (rilis terbaru saat ini) belum menyesuaikan.
+#
+# Ini nyata terjadi di run 38338510340 (Python 3.12 -> av 19.0.1) dan TIDAK
+# terdeteksi saat pengujian lokal, karena av 19 tidak menyediakan wheel cp311
+# sehingga lingkungan uji Python 3.11 tetap memakai av 18.1.0 dan lolos.
+av>=12,<19
 
 # TTS lokal. Wheel cp39-abi3 manylinux x86_64; dependency hanya onnxruntime +
 # pathvalidate (TANPA torch). espeak-ng-data sudah dibundel di wheel Linux.

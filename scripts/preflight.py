@@ -124,16 +124,69 @@ def check_whisper(model: str) -> bool:
         print(f"[whisper] GAGAL: {type(e).__name__}: {e}")
         print("  - Nama model valid: tiny, base, small, medium, large-v3,")
         print("    large-v3-turbo, distil-large-v3.")
-        print("  - Kalau 'Killed' / tidak ada pesan: kehabisan RAM. Runner")
-        print("    GitHub punya 16 GB; coba STT_COMPUTE_TYPE=int8 dan model")
-        print("    lebih kecil (small/medium).")
+        msg = f"{type(e).__name__}: {e}"
+        low = msg.lower()
+        if isinstance(e, MemoryError) or "alloc" in low or "killed" in low \
+                or "memory" in low:
+            print("  - Kehabisan RAM. Runner GitHub repo ini terukur 2 vCPU / 7 GB.")
+            print("    Urutan yang menolong: STT_THREADS=1, STT_COMPUTE_TYPE=int8,")
+            print("    lalu model lebih kecil (medium -> small -> base).")
+            print("    Perkiraan RAM: turbo ~3 GB, medium ~2 GB, small ~1 GB,")
+            print("    base ~0.5 GB.")
+        elif isinstance(e, TypeError) or "unexpected keyword" in low \
+                or "has no attribute" in low or "import" in low:
+            print("  - Ini BUKAN soal model atau RAM: ini ketidakcocokan versi")
+            print("    dependensi. Tersangka utama PyAV -- faster-whisper 1.2.1")
+            print("    memanggil av.open(..., metadata_errors='ignore') yang")
+            print("    dihapus di PyAV 19. Pastikan requirements.txt memuat")
+            print("    'av>=12,<19' dan step install memakai -r requirements.txt.")
+        else:
+            print("  - Nama model valid: tiny, base, small, medium, large-v3,")
+            print("    large-v3-turbo, distil-large-v3.")
+            print("  - Kalau download dari huggingface.co gagal, jalankan ulang")
+            print("    (model di-cache antar run).")
         return False
+
+
+def report_versions():
+    """Cetak versi dependensi biner.
+
+    Murah, dan membuat masalah ketidakcocokan versi langsung terbaca di log
+    tanpa perlu dibedah. Contoh nyata: run 38338510340 gagal karena PyAV 19
+    menghapus parameter `metadata_errors` yang dipakai faster-whisper 1.2.1 --
+    kalau versinya tercetak di baris pertama, penyebabnya langsung kelihatan.
+    """
+    hr("VERSI DEPENDENSI")
+    for mod, attr in (("faster_whisper", "__version__"), ("av", "__version__"),
+                      ("ctranslate2", "__version__"), ("onnxruntime", "__version__"),
+                      ("piper", None), ("openai", "__version__")):
+        try:
+            m = __import__(mod)
+            v = getattr(m, attr, "?") if attr else "terpasang"
+            print(f"  {mod:<16} {v}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  {mod:<16} GAGAL DIIMPOR: {type(e).__name__}: {e}")
+    # PyAV >= 19 tidak kompatibel dengan faster-whisper 1.2.1
+    try:
+        import av
+        major = int(str(av.__version__).split(".")[0])
+        if major >= 19:
+            print(f"  !! PyAV {av.__version__} >= 19 TIDAK kompatibel dengan "
+                  "faster-whisper 1.2.1")
+            print("     (av.open() kehilangan parameter 'metadata_errors').")
+            print("     Pin 'av>=12,<19' di requirements.txt.")
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"  python           {sys.version.split()[0]}")
+    return True
 
 
 def main():
     voice = env("TTS_PIPER_VOICE", "en_US-lessac-medium")
     model = env("STT_MODEL", "large-v3-turbo")
     print(f"[preflight] TTS_PIPER_VOICE={voice}  STT_MODEL={model}")
+    ok_deps = report_versions()
     print(f"[preflight] LLM_BASE_URL={'(diset)' if env('LLM_BASE_URL') else '(default OpenAI)'} "
           f"LLM_MODEL={env('LLM_MODEL', 'gpt-4o-mini')} "
           f"LLM_API_KEY={'ada' if env('LLM_API_KEY') else 'TIDAK ADA'}")
@@ -142,11 +195,12 @@ def main():
     ok_whisper = check_whisper(model)
 
     hr("RINGKASAN")
+    print(f"  Dependensi     : {'OK' if ok_deps else 'TIDAK KOMPATIBEL'}")
     print(f"  Piper TTS      : {'OK' if ok_piper else 'GAGAL'}")
     print(f"  faster-whisper : {'OK' if ok_whisper else 'GAGAL'}")
     print(f"  LLM_API_KEY    : {'ada' if env('LLM_API_KEY') else 'TIDAK ADA (wajib)'}")
 
-    if not (ok_piper and ok_whisper and env("LLM_API_KEY")):
+    if not (ok_deps and ok_piper and ok_whisper and env("LLM_API_KEY")):
         print("::error::Preflight gagal. Lihat detail di atas.")
         return 1
     print("::notice::Preflight OK: Piper TTS + faster-whisper siap, semua lokal.")
