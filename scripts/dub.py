@@ -83,7 +83,13 @@ STT_LANGUAGE = env("STT_LANGUAGE", "id")                 # kosong = auto-detect
 STT_VAD = env_bool("STT_VAD_FILTER", False)
 STT_MODEL_DIR = Path(env("STT_MODEL_DIR", ".whisper-models"))
 
-# --- TTS: Piper lokal ----------------------------------------------------
+# --- TTS lokal: piper (default) | kokoro --------------------------------
+# Keduanya jalan di CPU runner, tanpa API key / kuota / rate limit.
+#   piper  : RTF ~0.23x di 2 vCPU. Cepat, ringan (63 MB voice).
+#   kokoro : RTF ~1.37x di 2 vCPU (~6x lebih lambat), tapi prosodinya lebih
+#            natural. 82M parameter, model int8 92 MB + voices 28 MB.
+TTS_PROVIDER = env("TTS_PROVIDER", "piper").lower()
+
 PIPER_VOICE = env("TTS_PIPER_VOICE", "en_US-lessac-medium")
 PIPER_DIR = Path(env("TTS_PIPER_DIR", ".piper-voices"))
 PIPER_HF_BASE = env("TTS_PIPER_HF_BASE",
@@ -91,16 +97,35 @@ PIPER_HF_BASE = env("TTS_PIPER_HF_BASE",
 # length_scale > 1 = lebih lambat, < 1 = lebih cepat. Kosong = default model.
 PIPER_LENGTH_SCALE = env("TTS_PIPER_LENGTH_SCALE")
 
-TTS_TIMEOUT = float(env("TTS_TIMEOUT", "90"))           # detik, per percobaan
+# --- Kokoro-82M (opsi) ---------------------------------------------------
+KOKORO_VOICE = env("TTS_KOKORO_VOICE", "af_bella")
+KOKORO_DIR = Path(env("TTS_KOKORO_DIR", ".kokoro-models"))
+KOKORO_LANG = env("TTS_KOKORO_LANG", "en-us")
+KOKORO_SPEED = float(env("TTS_KOKORO_SPEED", "1.0"))
+KOKORO_MODEL_FILE = env("TTS_KOKORO_MODEL_FILE", "kokoro-v1.0.int8.onnx")
+KOKORO_VOICES_FILE = env("TTS_KOKORO_VOICES_FILE", "voices-v1.0.bin")
+KOKORO_BASE_URL = env(
+    "TTS_KOKORO_BASE_URL",
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0")
+# Kokoro mengalokasikan memori seiring panjang input (terukur: satu buffer conv
+# 157 MB untuk teks ~1000 karakter). Teks di atas batas ini dipecah per kalimat
+# lalu audio-nya disambung lagi di level array, bukan lewat ffmpeg.
+KOKORO_MAX_CHARS = max(100, int(env("TTS_KOKORO_MAX_CHARS", "500")))
+
+# Kokoro ~6x lebih lambat dari Piper, jadi butuh timeout lebih longgar.
+_DEFAULT_TIMEOUT = "240" if TTS_PROVIDER == "kokoro" else "90"
+TTS_TIMEOUT = float(env("TTS_TIMEOUT", _DEFAULT_TIMEOUT))
 TTS_CONCURRENCY = max(1, int(env("TTS_CONCURRENCY", "4")))
-PIPER_TRIES = max(1, int(env("PIPER_TRIES", "3")))
-PIPER_BACKOFF = float(env("PIPER_BACKOFF", "2"))
+TTS_TRIES = max(1, int(env("TTS_TRIES", env("PIPER_TRIES", "3"))))
+TTS_BACKOFF = float(env("TTS_BACKOFF", env("PIPER_BACKOFF", "2")))
 
 llm = None            # di-init di main()
 _STT = None           # model faster-whisper, di-load sekali
 _STT_LOCK = threading.Lock()
 _PIPER_VOICE = None   # model Piper, di-load sekali
 _PIPER_LOCK = threading.Lock()
+_KOKORO = None        # instance kokoro_onnx.Kokoro, di-load sekali
+_KOKORO_LOCK = threading.Lock()
 
 
 # ----------------------------------------------------------------- utils
@@ -369,6 +394,31 @@ def to_wav(src: Path, dst: Path, tempo: float = 1.0):
                  "-c:a", "pcm_s16le", dst])
 
 
+def _download_file(url: str, dst: Path, tries: int = 3):
+    """Download atomik (tulis ke .part lalu rename) dengan retry.
+
+    Dipakai bersama oleh Piper dan Kokoro. Atomic rename penting supaya file
+    setengah jadi tidak dianggap cache valid oleh run berikutnya.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() and dst.stat().st_size > 0:
+        return dst
+    tmp = dst.parent / (dst.name + ".part")
+    for attempt in range(tries):
+        try:
+            print(f"[model] download {url}")
+            urllib.request.urlretrieve(url, tmp)
+            tmp.replace(dst)
+            print(f"[model] {dst.name}: {dst.stat().st_size / 1e6:.1f} MB")
+            return dst
+        except Exception as e:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            if attempt == tries - 1:
+                raise RuntimeError(f"gagal download {dst.name} dari {url}: {e}") from e
+            time.sleep(3 * (attempt + 1))
+    return dst
+
+
 def _piper_ensure_model(name: str) -> Path:
     """Pastikan model suara Piper tersedia; download dari HuggingFace kalau belum.
 
@@ -393,23 +443,8 @@ def _piper_ensure_model(name: str) -> Path:
 
     PIPER_DIR.mkdir(parents=True, exist_ok=True)
     onnx = PIPER_DIR / f"{name}.onnx"
-    for dst, url in ((PIPER_DIR / f"{name}.onnx.json", base + ".onnx.json"),
-                     (onnx, base + ".onnx")):
-        if dst.exists() and dst.stat().st_size > 0:
-            continue
-        tmp = dst.parent / (dst.name + ".part")
-        for attempt in range(3):
-            try:
-                print(f"[piper] download {url}")
-                urllib.request.urlretrieve(url, tmp)
-                tmp.replace(dst)
-                break
-            except Exception as e:  # noqa: BLE001
-                tmp.unlink(missing_ok=True)
-                if attempt == 2:
-                    raise RuntimeError(
-                        f"gagal download voice Piper '{name}' dari {url}: {e}") from e
-                time.sleep(3 * (attempt + 1))
+    _download_file(base + ".onnx.json", PIPER_DIR / f"{name}.onnx.json")
+    _download_file(base + ".onnx", onnx)
     return onnx
 
 
@@ -448,25 +483,145 @@ def _piper_once(text: str, out: Path):
     tmp.replace(out)
 
 
+# --- provider: Kokoro-82M (opsi) ----------------------------------------
+def kokoro_split(text: str, limit: int = None):
+    """Pecah teks per batas kalimat supaya tidak melewati KOKORO_MAX_CHARS.
+
+    Kokoro tidak punya batas karakter keras seperti Orpheus (batasnya 510 fonem
+    dan dipecah sendiri oleh kokoro-onnx), TAPI alokasi memorinya tumbuh seiring
+    panjang input. Memecah di sini membuat pemakaian RAM tiap panggilan terikat
+    dan bisa diprediksi.
+    """
+    limit = limit or KOKORO_MAX_CHARS
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return [text] if text else []
+    parts, cur = [], ""
+    for sent in re.split(r"(?<=[.!?;:])\s+", text):
+        sent = sent.strip()
+        while len(sent) > limit:
+            cut = sent.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(sent[:cut].strip())
+            sent = sent[cut:].strip()
+        if not sent:
+            continue
+        if cur and len(cur) + 1 + len(sent) > limit:
+            parts.append(cur)
+            cur = sent
+        else:
+            cur = f"{cur} {sent}".strip()
+    if cur:
+        parts.append(cur)
+    return parts or [text[:limit]]
+
+
+def _kokoro_ensure_model():
+    """Pastikan model + voices Kokoro tersedia di KOKORO_DIR."""
+    low = KOKORO_MODEL_FILE.lower()
+    if "fp16" in low or "q8f16" in low or "q4f16" in low:
+        print(f"[kokoro] PERINGATAN: '{KOKORO_MODEL_FILE}' memakai bobot fp16 dan "
+              "TERUKUR SEGFAULT di onnxruntime CPU (bukan exception Python, jadi "
+              "tidak bisa ditangkap). Pakai kokoro-v1.0.int8.onnx (default) atau "
+              "kokoro-v1.0.onnx (fp32).")
+    KOKORO_DIR.mkdir(parents=True, exist_ok=True)
+    voices = _download_file(f"{KOKORO_BASE_URL}/{KOKORO_VOICES_FILE}",
+                            KOKORO_DIR / KOKORO_VOICES_FILE)
+    model = _download_file(f"{KOKORO_BASE_URL}/{KOKORO_MODEL_FILE}",
+                           KOKORO_DIR / KOKORO_MODEL_FILE)
+    return model, voices
+
+
+def _kokoro_get():
+    """Load Kokoro sekali per proses. Thread-safe: dipanggil dari to_thread."""
+    global _KOKORO
+    if _KOKORO is None:
+        with _KOKORO_LOCK:
+            if _KOKORO is None:                 # double-checked locking
+                from kokoro_onnx import Kokoro   # lazy: tidak perlu untuk piper
+                model, voices = _kokoro_ensure_model()
+                t0 = time.time()
+                inst = Kokoro(str(model), str(voices))
+                avail = inst.get_voices()
+                # Validasi SEBELUM assign ke _KOKORO. Kalau assign lebih dulu lalu
+                # raise, retry berikutnya melihat _KOKORO sudah terisi dan melewati
+                # validasi ini -- yang muncul malah ValueError internal kokoro_onnx
+                # ("Voice X not found in available voices") tanpa daftar pilihan.
+                if KOKORO_VOICE not in avail:
+                    raise RuntimeError(
+                        f"Voice Kokoro '{KOKORO_VOICE}' tidak ada. "
+                        f"{len(avail)} pilihan tersedia, mis: "
+                        f"{', '.join(sorted(avail)[:20])} ...")
+                _KOKORO = inst
+                print(f"[kokoro] model siap dalam {time.time() - t0:.1f}s "
+                      f"(voice {KOKORO_VOICE}, {len(avail)} voice tersedia, "
+                      f"lang={KOKORO_LANG}, speed={KOKORO_SPEED})")
+    return _KOKORO
+
+
+def _kokoro_once(text: str, out: Path):
+    """Sintesis Kokoro -> WAV 24 kHz. Output-nya sudah persis SR pipeline."""
+    import numpy as np
+    k = _kokoro_get()
+    pieces = []
+    for part in kokoro_split(text):
+        audio, sr = k.create(part, voice=KOKORO_VOICE,
+                             speed=KOKORO_SPEED, lang=KOKORO_LANG)
+        if audio is None or len(audio) == 0:
+            raise RuntimeError(f"Kokoro menghasilkan audio kosong untuk: {part!r}")
+        pieces.append((np.asarray(audio, dtype=np.float32), sr))
+    if not pieces:
+        raise RuntimeError("Kokoro tidak menghasilkan audio")
+    # gabung di level array (bukan ffmpeg): semua piece sr-nya sama
+    sr = pieces[0][1]
+    merged = pieces[0][0] if len(pieces) == 1 else np.concatenate([p[0] for p in pieces])
+    pcm = (np.clip(merged, -1.0, 1.0) * 32767).astype(np.int16)
+    tmp = out.parent / (out.stem + ".kokoro.part.wav")
+    with wave.open(str(tmp), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+    if not tmp.exists() or tmp.stat().st_size < 100:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("Kokoro menghasilkan audio kosong")
+    tmp.replace(out)
+
+
+def _tts_impl():
+    """Fungsi sintesis untuk provider yang dipilih."""
+    if TTS_PROVIDER == "kokoro":
+        return _kokoro_once
+    if TTS_PROVIDER != "piper":
+        raise RuntimeError(
+            f"TTS_PROVIDER '{TTS_PROVIDER}' tidak dikenal. Pilihan: piper, kokoro.")
+    return _piper_once
+
+
 async def tts(text: str, out: Path, sem: asyncio.Semaphore) -> str:
-    """Sintesis satu segmen ke `out`. Return 'piper' kalau berhasil."""
+    """Sintesis satu segmen ke `out`. Return nama provider kalau berhasil."""
+    impl = _tts_impl()
     async with sem:
         last = None
-        for attempt in range(PIPER_TRIES):
+        for attempt in range(TTS_TRIES):
             try:
                 # wait_for: sintesis yang menggantung tidak boleh memblokir selamanya
-                await asyncio.wait_for(asyncio.to_thread(_piper_once, text, out),
+                await asyncio.wait_for(asyncio.to_thread(impl, text, out),
                                        timeout=TTS_TIMEOUT)
                 if out.exists() and out.stat().st_size > 0:
-                    return "piper"
+                    return TTS_PROVIDER
                 last = RuntimeError("hasil TTS kosong")
             except asyncio.TimeoutError:
                 last = RuntimeError(f"timeout >{TTS_TIMEOUT:.0f}s")
             except Exception as e:  # noqa: BLE001
                 last = e
-            if attempt < PIPER_TRIES - 1:
-                await asyncio.sleep(PIPER_BACKOFF * (attempt + 1))
-        raise RuntimeError(f"Piper TTS gagal untuk: {text!r} ({last})")
+            if attempt < TTS_TRIES - 1:
+                await asyncio.sleep(TTS_BACKOFF * (attempt + 1))
+        raise RuntimeError(f"{TTS_PROVIDER} TTS gagal untuk: {text!r} ({last})")
 
 
 async def preflight_tts():
@@ -476,19 +631,29 @@ async def preflight_tts():
     puluhan segmen terjemahan terbuang (yang terjadi sebelum preflight ada).
     """
     probe = WORK / "_preflight.wav"
+    _tts_impl()   # validasi TTS_PROVIDER lebih awal, pesan error jelas
     sem = asyncio.Semaphore(1)
     t0 = time.time()
     try:
         await asyncio.wait_for(
             tts("Preflight check for the dubbing pipeline.", probe, sem),
             timeout=TTS_TIMEOUT * 2 + 60)
-        print(f"[preflight] Piper TTS OK dalam {time.time() - t0:.1f}s "
-              f"(voice {PIPER_VOICE})")
+        detail = (f"voice {PIPER_VOICE}" if TTS_PROVIDER == "piper"
+                  else f"voice {KOKORO_VOICE}, lang {KOKORO_LANG}")
+        print(f"[preflight] {TTS_PROVIDER} TTS OK dalam {time.time() - t0:.1f}s ({detail})")
     except Exception as e:  # noqa: BLE001
-        sys.exit(f"[preflight] Piper TTS gagal: {type(e).__name__}: {e}\n"
-                 "  - Cek nama voice (format en_US-lessac-medium) dan akses ke\n"
-                 "    huggingface.co dari runner.\n"
-                 "  - Kalau proses di-kill (OOM), onnxruntime kehabisan memori.")
+        if TTS_PROVIDER == "kokoro":
+            hint = ("  - Voice Kokoro harus salah satu dari 54 nama bawaan, mis.\n"
+                    "    af_bella, af_sarah, am_adam, am_michael, bm_george.\n"
+                    "  - Model HARUS varian int8/fp32. Varian fp16 (q8f16/q4f16/fp16)\n"
+                    "    terukur SEGFAULT di onnxruntime CPU dan tidak bisa ditangkap.\n"
+                    "  - Kalau 'Failed to allocate memory': teks terlalu panjang atau\n"
+                    "    RAM kurang. Turunkan TTS_KOKORO_MAX_CHARS.")
+        else:
+            hint = ("  - Cek nama voice (format en_US-lessac-medium) dan akses ke\n"
+                    "    huggingface.co dari runner.\n"
+                    "  - Kalau proses di-kill tanpa pesan: onnxruntime kehabisan memori.")
+        sys.exit(f"[preflight] {TTS_PROVIDER} TTS gagal: {type(e).__name__}: {e}\n{hint}")
     finally:
         probe.unlink(missing_ok=True)
 
@@ -726,7 +891,14 @@ def main():
     print(f"[init] video {video_dur:.1f}s, max_speedup={MAX_SPEEDUP}")
     print(f"[init] STT lokal: model={STT_MODEL} device={STT_DEVICE} "
           f"compute={STT_COMPUTE_TYPE} vad={STT_VAD} lang={STT_LANGUAGE or 'auto'}")
-    print(f"[init] TTS lokal: piper_voice={PIPER_VOICE} concurrency={TTS_CONCURRENCY}")
+    if TTS_PROVIDER == "kokoro":
+        print(f"[init] TTS lokal: provider=kokoro voice={KOKORO_VOICE} "
+              f"lang={KOKORO_LANG} speed={KOKORO_SPEED} concurrency={TTS_CONCURRENCY}")
+        print(f"[init] catatan: Kokoro ~6x lebih lambat dari Piper "
+              f"(RTF ~1.4 vs ~0.23 di 2 vCPU)")
+    else:
+        print(f"[init] TTS lokal: provider=piper voice={PIPER_VOICE} "
+              f"concurrency={TTS_CONCURRENCY}")
     print(f"[init] LLM (satu-satunya cloud): model={LLM_MODEL} "
           f"base_url={LLM_BASE or '(default OpenAI)'}")
 

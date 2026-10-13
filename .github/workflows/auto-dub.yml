@@ -46,8 +46,16 @@ on:
         default: false
         type: boolean
 
+      tts_provider:
+        description: "TTS lokal. piper = tercepat (RTF ~0.23x). kokoro = prosodi lebih natural tapi ~6x lebih lambat (RTF ~1.4x)"
+        required: false
+        default: "piper"
+        type: choice
+        options:
+          - piper
+          - kokoro
       piper_voice:
-        description: "Piper voice LOKAL. *-medium cepat (RTF ~0.15x); *-high lebih bagus tapi ~6x lebih lambat"
+        description: "Piper voice (dipakai kalau tts_provider=piper). *-medium cepat; *-high lebih bagus tapi ~6x lebih lambat"
         required: false
         default: "en_US-lessac-medium"
         type: choice
@@ -57,6 +65,25 @@ on:
           - en_US-kristin-medium
           - en_US-ryan-high
           - en_GB-alba-medium
+      kokoro_voice:
+        description: "Kokoro voice (dipakai kalau tts_provider=kokoro). af_=wanita AS, am_=pria AS, bf_/bm_=Inggris"
+        required: false
+        default: "af_bella"
+        type: choice
+        options:
+          - af_bella
+          - af_sarah
+          - af_nicole
+          - af_heart
+          - af_nova
+          - am_adam
+          - am_michael
+          - am_echo
+          - am_eric
+          - bm_george
+          - bm_lewis
+          - bf_emma
+          - bf_isabella
 
       llm_model:
         description: "Model LLM untuk terjemahan (OpenAI-compatible) -- satu-satunya panggilan cloud"
@@ -151,6 +178,15 @@ jobs:
           path: .piper-voices/
           key: piper-voice-${{ inputs.piper_voice }}
 
+      # Model Kokoro (int8 92 MB) + voices-v1.0.bin (28 MB, berisi 54 voice).
+      # Key tidak bergantung nama voice karena satu file voices memuat semuanya.
+      - name: Cache model Kokoro
+        if: inputs.tts_provider == 'kokoro'
+        uses: actions/cache@v6
+        with:
+          path: .kokoro-models/
+          key: kokoro-model-v1.0-int8
+
       # Key cache dihitung dari ISI video (bukan nama file), supaya video dari
       # video_url tidak bentrok dengan input/video.mp4 yang ada di repo.
       - name: Hitung cache key
@@ -188,9 +224,11 @@ jobs:
 
       # Fail fast: pastikan Piper + Whisper + LLM key siap SEBELUM pipeline jalan.
       # Menangkap nama model salah / download gagal / OOM dalam ~30 detik.
-      - name: Preflight (Piper TTS + Whisper)
+      - name: Preflight (TTS lokal + Whisper)
         env:
+          TTS_PROVIDER: ${{ inputs.tts_provider }}
           TTS_PIPER_VOICE: ${{ inputs.piper_voice }}
+          TTS_KOKORO_VOICE: ${{ inputs.kokoro_voice }}
           STT_MODEL: ${{ inputs.stt_model }}
           STT_COMPUTE_TYPE: ${{ inputs.stt_compute_type }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -209,7 +247,9 @@ jobs:
           STT_COMPUTE_TYPE: ${{ inputs.stt_compute_type }}
           STT_VAD_FILTER: ${{ inputs.stt_vad_filter }}
           STT_DEVICE: cpu
+          TTS_PROVIDER: ${{ inputs.tts_provider }}
           TTS_PIPER_VOICE: ${{ inputs.piper_voice }}
+          TTS_KOKORO_VOICE: ${{ inputs.kokoro_voice }}
           TTS_CONCURRENCY: ${{ inputs.tts_concurrency }}
           MAX_SPEEDUP: ${{ inputs.max_speedup }}
           KEEP_ORIGINAL_VOLUME: ${{ inputs.keep_original_volume }}

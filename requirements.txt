@@ -31,9 +31,24 @@ faster-whisper>=1.2.0
 # sehingga lingkungan uji Python 3.11 tetap memakai av 18.1.0 dan lolos.
 av>=12,<19
 
-# TTS lokal. Wheel cp39-abi3 manylinux x86_64; dependency hanya onnxruntime +
+# TTS lokal default. Wheel cp39-abi3 manylinux x86_64; dependency hanya onnxruntime +
 # pathvalidate (TANPA torch). espeak-ng-data sudah dibundel di wheel Linux.
 piper-tts>=1.8.0
+
+# TTS lokal OPSI (dipakai kalau input tts_provider=kokoro). Kualitas prosodi lebih
+# natural dari Piper, tapi terukur ~6x lebih lambat di 2 vCPU (RTF ~1.4 vs ~0.23).
+#
+# Dependensinya ringan: onnxruntime (sudah ada untuk Piper) + phonemizer +
+# espeakng-loader. PENTING: espeak-ng TIDAK perlu di-install lewat apt --
+# espeakng-loader sudah membundel datanya, dan ini sudah diverifikasi di runner.
+#
+# Model & voices TIDAK datang dari PyPI: di-download saat runtime dari rilis
+# github.com/thewh1teagle/kokoro-onnx (int8 92 MB + voices 28 MB) lalu di-cache
+# oleh step "Cache model Kokoro".
+#
+# Jangan pakai varian model fp16 (q8f16/q4f16): TERUKUR segfault di onnxruntime
+# CPU -- crash native yang tidak bisa ditangkap try/except.
+kokoro-onnx>=0.6.1
 
 # LLM penerjemah (OpenAI-compatible). openai 3.x sudah terbukti jalan di run
 # yang sukses; batas <4 supaya tidak ada breaking change mayor yang lolos diam-diam.
