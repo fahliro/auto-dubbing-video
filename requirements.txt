@@ -1,29 +1,28 @@
 # ---------------------------------------------------------------------------
-# TTS lokal (provider DEFAULT). Jalan sepenuhnya offline di runner: tanpa API
-# key, tanpa rate limit, tanpa terms, dan tidak bisa diblokir berdasarkan IP.
-# Butuh onnxruntime (ikut terpasang sebagai dependency) + espeak-ng-data
-# (sudah dibundel di wheel piper-tts untuk Linux).
+# Pipeline ini sekarang LOKAL untuk STT dan TTS. Satu-satunya panggilan cloud
+# adalah LLM penerjemah (lihat LLM_API_KEY / LLM_BASE_URL).
 #
-# Ini jawaban atas dua kebuntuan sekaligus:
-#   - Edge TTS  -> 403, Microsoft memblokir IP datacenter GitHub Actions
-#   - Groq TTS  -> RPM=10, RPD=100/hari; video 92 segmen menghabiskan kuota
+# Kenapa tidak pakai layanan TTS/STT cloud:
+#   - Edge TTS        : 403. Microsoft memblokir IP datacenter runner GitHub
+#                       Actions. Di luar kendali repo, re-run tidak menolong.
+#   - Groq Orpheus TTS: tier gratis RPM=10, RPD=100. Video 92 segmen
+#                       menghabiskan kuota harian dalam satu run.
+#   - Groq Whisper    : RPM=20, RPD=2000, plus harus upload audio tiap run.
+#   ctranslate2 (Whisper) dan onnxruntime (Piper) jalan di CPU runner 4 vCPU /
+#   16 GB: tanpa API key, tanpa kuota, tanpa rate limit, tak bisa diblok per IP.
+# ---------------------------------------------------------------------------
+
+# STT lokal. Wheel cp39-abi3 manylinux; dependency ctranslate2 + av + huggingface-hub.
+# Model di-download sekali lalu di-cache oleh step "Cache model Whisper" di workflow.
+faster-whisper>=1.2.0
+
+# TTS lokal. Wheel cp39-abi3 manylinux x86_64; dependency hanya onnxruntime +
+# pathvalidate (TANPA torch). espeak-ng-data sudah dibundel di wheel Linux.
 piper-tts>=1.8.0
 
-# edge-tts tetap dipakai kalau TTS_PROVIDER=edge atau auto (dan Edge tidak diblokir).
-#
-# PENTING: 403 "Invalid response status" dari speech.platform.bing.com biasanya
-# BUKAN soal versi -- Microsoft memblokir berdasarkan IP asal. Runner GitHub
-# Actions (range Azure) termasuk yang diblokir. Bump versi saja tidak menolong.
-# `pip install -U` di workflow tetap memaksa versi terbaru, jadi kalau suatu
-# saat Microsoft menaikkan versi Chromium minimum dan edge-tts merilis update,
-# build otomatis ikut terangkat.
-#
-# Diimpor lazy di dub.py, jadi run dengan TTS_PROVIDER=piper tidak bergantung
-# pada paket ini sama sekali.
-edge-tts>=7.2.8
-
-# openai 3.x sudah dipakai di run yang sukses; batas <4 supaya tidak ada
-# breaking change mayor yang lolos diam-diam.
+# LLM penerjemah (OpenAI-compatible). openai 3.x sudah terbukti jalan di run
+# yang sukses; batas <4 supaya tidak ada breaking change mayor yang lolos diam-diam.
 openai>=1.40.0,<4
 
+# Datang transitif lewat huggingface-hub, tapi dipin eksplisit demi reproducibility.
 requests>=2.31.0,<3

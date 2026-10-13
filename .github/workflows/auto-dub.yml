@@ -1,7 +1,7 @@
 name: Auto Dub (ID -> EN)
 
-# Dua run bersamaan = dua runner menghajar endpoint TTS sekaligus,
-# yang memperbesar peluang kena throttle/blokir. Antrikan saja.
+# Dua run bersamaan = dua runner berat (Whisper + Piper + ffmpeg) jalan paralel.
+# Antrikan saja supaya tidak saling berebut dan hasilnya mudah dilacak.
 concurrency:
   group: auto-dub-${{ github.ref }}
   cancel-in-progress: false
@@ -18,18 +18,36 @@ on:
         required: false
         default: "input/video.mp4"
         type: string
-      tts_provider:
-        description: "Provider TTS. 'piper' = lokal/offline (tanpa kuota & tanpa blokir IP)"
+
+      stt_model:
+        description: "Model faster-whisper LOKAL. turbo = akurasi mendekati large-v3 tapi jauh lebih cepat"
         required: false
-        default: "piper"
+        default: "large-v3-turbo"
         type: choice
         options:
-          - piper
-          - auto
-          - groq
-          - edge
+          - large-v3-turbo
+          - large-v3
+          - medium
+          - small
+          - base
+          - tiny
+      stt_compute_type:
+        description: "Presisi Whisper. int8 = tercepat & paling hemat RAM (disarankan di CPU)"
+        required: false
+        default: "int8"
+        type: choice
+        options:
+          - int8
+          - int8_float32
+          - float32
+      stt_vad_filter:
+        description: "VAD: buang bagian sunyi. Matikan default; nyalakan kalau transkrip berhalusinasi saat video banyak hening"
+        required: false
+        default: false
+        type: boolean
+
       piper_voice:
-        description: "Piper voice (lokal). *-medium cepat (RTF 0.15x); *-high lebih bagus tapi 6x lebih lambat"
+        description: "Piper voice LOKAL. *-medium cepat (RTF ~0.15x); *-high lebih bagus tapi ~6x lebih lambat"
         required: false
         default: "en_US-lessac-medium"
         type: choice
@@ -39,33 +57,9 @@ on:
           - en_US-kristin-medium
           - en_US-ryan-high
           - en_GB-alba-medium
-      voice:
-        description: "Edge TTS voice (hanya dipakai kalau provider = edge/auto)"
-        required: false
-        default: "en-US-AndrewNeural"
-        type: string
-      tts_groq_voice:
-        description: "Groq Orpheus voice (provider = groq). PERHATIAN: tier gratis cuma RPM=10, RPD=100/hari"
-        required: false
-        default: "troy"
-        type: choice
-        options:
-          - troy
-          - austin
-          - daniel
-          - autumn
-          - diana
-          - hannah
-      stt_model:
-        description: "Model Whisper di Groq"
-        required: false
-        default: "whisper-large-v3"
-        type: choice
-        options:
-          - whisper-large-v3
-          - whisper-large-v3-turbo
+
       llm_model:
-        description: "Model LLM untuk terjemahan (OpenAI-compatible)"
+        description: "Model LLM untuk terjemahan (OpenAI-compatible) -- satu-satunya panggilan cloud"
         required: false
         default: "kilo-auto/free"
         type: string
@@ -90,7 +84,7 @@ on:
         default: "0"
         type: string
       tts_concurrency:
-        description: "Jumlah request TTS paralel. Untuk groq biarkan 1-2 (RPM cuma 10)"
+        description: "Jumlah sintesis Piper paralel (lokal, tidak ada rate limit)"
         required: false
         default: "4"
         type: string
@@ -121,7 +115,10 @@ jobs:
           pip install -U -r requirements.txt
           echo "--- versi terpasang ---"
           (pip show piper-tts 2>/dev/null | head -n 2) || true
-          (pip show edge-tts 2>/dev/null | head -n 2) || true
+          (pip show faster-whisper 2>/dev/null | head -n 2) || true
+          echo "--- sumber daya runner ---"
+          echo "vCPU : $(nproc)"
+          echo "RAM  : $(free -g | awk '/^Mem:/{print $2}') GB"
 
       - name: Siapkan video input
         env:
@@ -139,8 +136,15 @@ jobs:
             echo "Isi video_url atau video_path"; exit 1
           fi
 
-      # Model suara Piper (~63 MB) di-cache per nama voice, supaya tidak
-      # download ulang tiap run.
+      # Model faster-whisper di-cache per (nama model + presisi). large-v3-turbo
+      # ~1.6 GB; tanpa cache tiap run download ulang dari huggingface.co.
+      - name: Cache model Whisper
+        uses: actions/cache@v6
+        with:
+          path: .whisper-models/
+          key: whisper-model-${{ inputs.stt_model }}-${{ inputs.stt_compute_type }}
+
+      # Model suara Piper (~63 MB untuk *-medium, ~121 MB untuk *-high).
       - name: Cache model suara Piper
         uses: actions/cache@v6
         with:
@@ -160,15 +164,15 @@ jobs:
           else
             K="path-$(sha256sum "$VIDEO_PATH" | cut -c1-32)"
           fi
-          # run_attempt ikut di key agar tiap percobaan bisa menyimpan progres
-          # barunya sendiri; restore-keys mengambil progres attempt sebelumnya.
+          # run_attempt ikut di key agar tiap percobaan menyimpan progres barunya
+          # sendiri; restore-keys mengambil progres attempt sebelumnya.
           echo "key=dub-work-${K}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
           echo "restore=dub-work-${K}-" >> "$GITHUB_OUTPUT"
           echo "cache key: dub-work-${K}-${{ github.run_attempt }}"
 
       # Cache hasil STT + translate + audio TTS per segmen.
-      # Efeknya: kalau run gagal di tahap akhir, re-run tidak membayar ulang
-      # kuota Groq Whisper & LLM, dan segmen yang sudah jadi tidak di-TTS ulang.
+      # Efeknya: kalau run gagal di tahap akhir, re-run tidak mengulang
+      # faster-whisper maupun LLM, dan segmen yang sudah jadi tidak disintesis ulang.
       # Aman walau key salah: dub.py memvalidasi state.json terhadap SHA-256 video.
       - name: Restore cache kerja
         id: restore-work
@@ -182,29 +186,30 @@ jobs:
           key: ${{ steps.cachekey.outputs.key }}
           restore-keys: ${{ steps.cachekey.outputs.restore }}
 
-      # Fail fast: beberapa detik, sebelum kuota Groq STT + LLM dipakai.
-      - name: Cek provider TTS
+      # Fail fast: pastikan Piper + Whisper + LLM key siap SEBELUM pipeline jalan.
+      # Menangkap nama model salah / download gagal / OOM dalam ~30 detik.
+      - name: Preflight (Piper TTS + Whisper)
         env:
-          TTS_PROVIDER: ${{ inputs.tts_provider }}
           TTS_PIPER_VOICE: ${{ inputs.piper_voice }}
-          TTS_VOICE: ${{ inputs.voice }}
-          TTS_GROQ_VOICE: ${{ inputs.tts_groq_voice }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: python scripts/tts_probe.py
+          STT_MODEL: ${{ inputs.stt_model }}
+          STT_COMPUTE_TYPE: ${{ inputs.stt_compute_type }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ inputs.llm_model }}
+        run: python scripts/preflight.py
 
       - name: Jalankan auto dubbing
         env:
           # VIDEO_FILE sengaja tidak dideklarasikan di sini: nilai yang ditulis ke
           # $GITHUB_ENV di step atas sudah otomatis ikut ke environment step ini.
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}   # mis. https://api.openai.com/v1
           LLM_MODEL: ${{ inputs.llm_model }}
           STT_MODEL: ${{ inputs.stt_model }}
-          TTS_PROVIDER: ${{ inputs.tts_provider }}
+          STT_COMPUTE_TYPE: ${{ inputs.stt_compute_type }}
+          STT_VAD_FILTER: ${{ inputs.stt_vad_filter }}
+          STT_DEVICE: cpu
           TTS_PIPER_VOICE: ${{ inputs.piper_voice }}
-          TTS_VOICE: ${{ inputs.voice }}
-          TTS_GROQ_VOICE: ${{ inputs.tts_groq_voice }}
           TTS_CONCURRENCY: ${{ inputs.tts_concurrency }}
           MAX_SPEEDUP: ${{ inputs.max_speedup }}
           KEEP_ORIGINAL_VOLUME: ${{ inputs.keep_original_volume }}
@@ -213,8 +218,8 @@ jobs:
         run: python scripts/dub.py
 
       # PENTING: simpan cache walau job GAGAL. Tanpa ini, puluhan segmen yang
-      # sudah berhasil di-TTS ikut terbuang (terjadi di run 38286526459:
-      # 50 segmen sukses hilang karena post-step actions/cache di-skip).
+      # sudah berhasil disintesis ikut terbuang (pernah terjadi: 50 segmen hilang
+      # karena post-step actions/cache di-skip saat job gagal).
       - name: Simpan cache kerja
         if: always()
         uses: actions/cache/save@v6
