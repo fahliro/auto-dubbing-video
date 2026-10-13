@@ -1106,7 +1106,11 @@ def main():
     else:
         print(f"[init] TTS lokal: provider=piper voice={PIPER_VOICE} "
               f"concurrency={TTS_CONCURRENCY}")
-    print(f"[init] LLM (satu-satunya cloud): model={LLM_MODEL} "
+    # Label "satu-satunya cloud" hanya benar kalau STT-nya lokal. Dengan
+    # stt_provider=groq ada DUA panggilan cloud, dan menyebut sebaliknya akan
+    # menyesatkan saat membaca log untuk mendiagnosis biaya/kuota.
+    cloud = "cloud" if STT_PROVIDER == "groq" else "satu-satunya cloud"
+    print(f"[init] LLM ({cloud}): model={LLM_MODEL} "
           f"base_url={LLM_BASE or '(default OpenAI)'}")
 
     video_sha = sha256_file(VIDEO)
@@ -1139,7 +1143,7 @@ def main():
         if not segs:
             sys.exit("Tidak ada ucapan terdeteksi")
         print(f"[stt] {len(segs)} segmen")
-        lap("STT lokal")
+        lap(f"STT {STT_PROVIDER}")
         compute_slots(segs, video_dur)
         translate(segs)
         lap("LLM translate")
